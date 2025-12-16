@@ -6,3 +6,4 @@ botorch
 torch
 matplotlib
 seaborn
+scikit-learn

@@ -1,0 +1,555 @@
+import numpy as np
+from dataclasses import dataclass
+from matplotlib import pyplot as plt
+from numpy.random import default_rng
+
+from fire_model.boundary import (
+    FireBoundary,
+    between_boundaries_mask,
+    extract_fire_boundary,
+    plot_fire_boundary,
+)
+
+
+@dataclass(frozen=True)
+class FireEnv:
+    grid_size: tuple[int, int]
+    domain_km: float
+    fuel: np.ndarray  # (nx, ny)
+    value: np.ndarray  # (nx, ny)
+    wind: np.ndarray  # (T, nx, ny, 2) or (nx, ny, 2) if constant
+    dt_s: float  # seconds per CA step
+    burn_time_s0: float = 600.0
+    retardant_half_life_s: float = 1800.0
+    retardant_k: float = 1.0
+    drop_w_km: float = 0.2
+    drop_h_km: float = 1.0
+    drop_amount: float = 1.0
+    ros_mps: float = 0.5
+    wind_coeff: float = 0.6
+    diag: bool = True
+
+
+@dataclass
+class FireState:
+    burning: np.ndarray  # (..., nx, ny) bool or float
+    burned: np.ndarray  # (..., nx, ny) bool or float
+    burn_remaining_s: np.ndarray  # (..., nx, ny) float
+    retardant: np.ndarray  # (n_sims, nx, ny) float
+    t: int = 0
+
+
+class CAFireModel:
+    def __init__(self, env: FireEnv, seed: int | None = None):
+        self.env = env
+        self.base_seed = seed
+
+        nx, _ = env.grid_size
+        self.dx = self.env.domain_km / nx
+        self.dx_m = self.dx * 1000.0
+
+    def init_state_batch(self, n_sims: int, center, radius_km: float) -> FireState:
+        nx, ny = self.env.grid_size
+        radius_cells = int(radius_km / self.dx)
+
+        x = np.arange(nx)[:, None]
+        y = np.arange(ny)[None, :]
+        cx, cy = center
+        mask2d = (x - cx) ** 2 + (y - cy) ** 2 <= radius_cells ** 2
+
+        burning = np.zeros((n_sims, nx, ny), dtype=bool)
+        burning[:, mask2d] = True
+
+        burned = np.zeros((n_sims, nx, ny), dtype=bool)
+        burn_remaining_s = np.broadcast_to(self.env.burn_time_s0, (n_sims, nx, ny)).copy()
+        retardant = np.zeros((n_sims, nx, ny), dtype=float)
+        return FireState(burning=burning, burned=burned, burn_remaining_s=burn_remaining_s, t=0, retardant=retardant)
+
+    @staticmethod
+    def _shift_no_wrap(a: np.ndarray, sx: int, sy: int) -> np.ndarray:
+        n_sims, nx, ny = a.shape
+        out = np.zeros_like(a)
+
+        x_from0 = max(0, -sx)
+        x_from1 = min(nx, nx - sx)
+        y_from0 = max(0, -sy)
+        y_from1 = min(ny, ny - sy)
+
+        x_to0 = max(0, sx)
+        x_to1 = min(nx, nx + sx)
+        y_to0 = max(0, sy)
+        y_to1 = min(ny, ny + sy)
+
+        if x_from0 < x_from1 and y_from0 < y_from1:
+            out[:, x_to0:x_to1, y_to0:y_to1] = a[:, x_from0:x_from1, y_from0:y_from1]
+        return out
+
+    def step_batch(
+        self,
+        state: FireState,
+        *,
+        ros_mps: float = 0.5,
+        wind_coeff: float = 0.5,
+        diag: bool = True,
+    ):
+        env = self.env
+        dt_s = float(env.dt_s)
+        dx_m = float(self.dx_m)
+
+        burning = state.burning
+        burned = state.burned
+
+        seed = None if self.base_seed is None else (self.base_seed + state.t)
+        rng = np.random.default_rng(seed)
+
+        hl = float(env.retardant_half_life_s)
+        if hl > 0.0:
+            decay = np.exp(-np.log(2.0) * dt_s / hl)
+            state.retardant *= decay
+
+        state.burn_remaining_s[burning] = np.maximum(0.0, state.burn_remaining_s[burning] - dt_s)
+        newly_burned = burning & (state.burn_remaining_s <= 0.0)
+        burned[newly_burned] = True
+        burning[newly_burned] = False
+
+        if not np.any(burning):
+            state.t += 1
+            return
+
+        unburned = ~(burning | burned)
+        w = env.wind[state.t] if env.wind.ndim == 4 else env.wind
+        wx = w[..., 0][None, :, :]
+        wy = w[..., 1][None, :, :]
+        fuel_mul = env.fuel[None, :, :]
+        lambda0 = ros_mps / dx_m
+
+        if diag:
+            dirs = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+        else:
+            dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+        prob_no = np.ones_like(state.burn_remaining_s, dtype=float)
+        k = float(env.retardant_k)
+        retardant_attn = np.exp(-k * np.maximum(state.retardant, 0.0))
+
+        for sx, sy in dirs:
+            src = self._shift_no_wrap(burning, sx, sy)
+            if not np.any(src):
+                continue
+
+            dist = float(np.hypot(sx, sy))
+            ux, uy = sx / dist, sy / dist
+
+            align = wx * ux + wy * uy
+            bias = 1.0 + wind_coeff * np.maximum(0.0, align)
+
+            lambda_dir = (lambda0 / dist) * fuel_mul * bias
+            lambda_dir = lambda_dir * retardant_attn
+
+            p_dir = 1.0 - np.exp(-lambda_dir * dt_s)
+            p_dir = np.clip(p_dir, 0.0, 1.0)
+
+            prob_no *= np.where(src, (1.0 - p_dir), 1.0)
+
+        ignite_prob = np.clip(1.0 - prob_no, 0.0, 1.0)
+        u = rng.random(size=ignite_prob.shape)
+        newly_ignited = unburned & (u < ignite_prob)
+
+        if np.any(newly_ignited):
+            burning[newly_ignited] = True
+            state.burn_remaining_s[newly_ignited] = float(env.burn_time_s0)
+
+        state.t += 1
+
+    def simulate_burned_probability(
+        self,
+        T: int,
+        n_sims: int,
+        center,
+        radius_km: float,
+        *,
+        ros_mps: float = 0.5,
+        wind_coeff: float = 0.50,
+        diag: bool = True,
+    ) -> np.ndarray:
+        state = self.init_state_batch(n_sims=n_sims, center=center, radius_km=radius_km)
+        num_steps = int(T / self.env.dt_s)
+        for _ in range(num_steps):
+            self.step_batch(state, ros_mps=ros_mps, wind_coeff=wind_coeff, diag=diag)
+        p_affected = (state.burned | state.burning).mean(axis=0)
+        return p_affected
+
+    def aggregate_mc_to_state(self, batch_state: FireState) -> FireState:
+        burning_bool = batch_state.burning
+        burned_bool = batch_state.burned
+
+        p_burning = burning_bool.mean(axis=0)
+        p_burned = burned_bool.mean(axis=0)
+
+        burn_sum = (batch_state.burn_remaining_s * burning_bool).sum(axis=0)
+        burn_cnt = burning_bool.sum(axis=0).astype(float)
+        burn_mean_cond = np.divide(
+            burn_sum,
+            burn_cnt,
+            out=np.zeros_like(burn_sum, dtype=float),
+            where=(burn_cnt > 0),
+        )
+
+        r_mean = batch_state.retardant.mean(axis=0)
+
+        return FireState(
+            burning=p_burning[None, :, :],
+            burned=p_burned[None, :, :],
+            burn_remaining_s=burn_mean_cond[None, :, :],
+            retardant=r_mean[None, :, :],
+            t=batch_state.t,
+        )
+
+    def extract_fire_boundary(
+        self,
+        firestate,
+        *,
+        K: int,
+        p_boundary: float = 0.5,
+        field: str = "affected",
+        anchor: str = "max_x",
+        ccw: bool = True,
+    ) -> FireBoundary:
+        return extract_fire_boundary(
+            firestate,
+            K=K,
+            p_boundary=p_boundary,
+            field=field,
+            anchor=anchor,
+            ccw=ccw,
+        )
+
+    def plot_fire_boundary(
+        self,
+        firestate,
+        boundary: FireBoundary,
+        *,
+        field: str = "affected",
+        title: str | None = None,
+        show_points: bool = True,
+    ):
+        return plot_fire_boundary(
+            firestate,
+            boundary,
+            field=field,
+            title=title,
+            show_points=show_points,
+        )
+
+    def discretise_between_boundaries(
+        self,
+        init_fire_boundary: FireBoundary,
+        final_fire_boundary: FireBoundary,
+    ) -> np.ndarray:
+        return between_boundaries_mask(init_fire_boundary.xy, final_fire_boundary.xy, self.env.grid_size)
+
+    def plot_search_domain(self, discrete_grid_between_boundaries: np.ndarray, title: str = "Region Between Fire Boundaries"):
+        plt.figure(figsize=(6, 5))
+        im = plt.imshow(discrete_grid_between_boundaries.T, origin="lower", aspect="equal")
+        plt.colorbar(im, label="Search Domain (Between Fire Boundaries)")
+        plt.xlabel("x cell")
+        plt.ylabel("y cell")
+        plt.title(title)
+        plt.tight_layout()
+        plt.show()
+
+    def apply_retardant_cartesian(
+        self,
+        state: FireState,
+        drone_params: np.ndarray | None,
+        *,
+        drop_w_km: float,
+        drop_h_km: float,
+        amount: float = 1.0,
+    ):
+        if drone_params is None:
+            return
+        drone_params = np.asarray(drone_params, dtype=float)
+        if drone_params.size == 0:
+            return
+        if drone_params.ndim != 2 or drone_params.shape[1] != 3:
+            raise ValueError(f"drone_params must have shape (D,3); got {drone_params.shape}")
+
+        n_sims, nx, ny = state.retardant.shape
+        half_w = 0.5 * (drop_w_km / self.dx)
+        half_h = 0.5 * (drop_h_km / self.dx)
+
+        X = np.arange(nx)[:, None]
+        Y = np.arange(ny)[None, :]
+
+        for x0, y0, phi in drone_params:
+            xp = X - x0
+            yp = Y - y0
+
+            c = np.cos(phi)
+            s = np.sin(phi)
+
+            xr = c * xp + s * yp
+            yr = -s * xp + c * yp
+
+            mask = (np.abs(xr) <= half_w) & (np.abs(yr) <= half_h)
+            state.retardant[:, mask] += amount
+
+    def simulate_from_ignition(
+        self,
+        T: int,
+        n_sims: int,
+        center,
+        radius_km: float,
+        *,
+        drone_params: np.ndarray | None = None,
+        ros_mps: float = 0.5,
+        wind_coeff: float = 0.50,
+        diag: bool = True,
+    ) -> np.ndarray:
+        state = self.init_state_batch(n_sims=n_sims, center=center, radius_km=radius_km)
+        self.apply_retardant_cartesian(
+            state,
+            drone_params,
+            drop_w_km=self.env.drop_w_km,
+            drop_h_km=self.env.drop_h_km,
+            amount=self.env.drop_amount,
+        )
+
+        num_steps = int(T / self.env.dt_s)
+        for _ in range(num_steps):
+            self.step_batch(state, ros_mps=ros_mps, wind_coeff=wind_coeff, diag=diag)
+
+        updated_firestate = self.aggregate_mc_to_state(state)
+        return updated_firestate
+
+    def simulate_from_firestate(
+        self,
+        init_firestate: FireState,
+        T: float,
+        n_sims: int,
+        *,
+        drone_params: np.ndarray | None = None,
+        ros_mps: float = 0.5,
+        wind_coeff: float = 0.50,
+        diag: bool = True,
+        seed: int | None = None,
+    ) -> FireState:
+        nx, ny = self.env.grid_size
+        dt_s = float(self.env.dt_s)
+        num_steps = int(np.ceil(float(T) / dt_s))
+
+        if seed is None:
+            seed = None if getattr(self, "base_seed", None) is None else (self.base_seed + int(init_firestate.t))
+        rng = np.random.default_rng(seed)
+
+        def _ensure_batched(arr, dtype=None):
+            a = np.asarray(arr)
+            if dtype is not None:
+                a = a.astype(dtype, copy=False)
+            if a.ndim == 2:
+                a = a[None, :, :]
+            if a.shape[1:] != (nx, ny):
+                raise ValueError(f"Expected shape (*,{nx},{ny}), got {a.shape}")
+            return a
+
+        burning0 = _ensure_batched(init_firestate.burning)
+        burned0 = _ensure_batched(init_firestate.burned)
+        br0 = _ensure_batched(init_firestate.burn_remaining_s, dtype=float)
+        ret0 = _ensure_batched(init_firestate.retardant, dtype=float)
+        t0 = int(init_firestate.t)
+
+        if burning0.dtype == bool and burned0.dtype == bool:
+            m = burning0.shape[0]
+            if m == n_sims:
+                burning = burning0.copy()
+                burned = burned0.copy()
+                burn_remaining_s = br0.copy()
+            else:
+                reps = int(np.ceil(n_sims / m))
+                burning = np.tile(burning0, (reps, 1, 1))[:n_sims].copy()
+                burned = np.tile(burned0, (reps, 1, 1))[:n_sims].copy()
+                burn_remaining_s = np.tile(br0, (reps, 1, 1))[:n_sims].copy()
+
+            burning &= ~burned
+            burn_remaining_s[burned] = 0.0
+
+            retardant = ret0.copy() if m == n_sims else np.tile(ret0, (reps, 1, 1))[:n_sims].copy()
+            state = FireState(burning=burning, burned=burned, burn_remaining_s=burn_remaining_s, retardant=retardant, t=t0)
+        else:
+            p_burning = burning0[0].astype(float, copy=False)
+            p_burned = burned0[0].astype(float, copy=False)
+
+            p_burned = np.clip(p_burned, 0.0, 1.0)
+            p_burning = np.clip(p_burning, 0.0, 1.0)
+            p_burning = np.minimum(p_burning, 1.0 - p_burned)
+
+            u = rng.random((n_sims, nx, ny))
+            burned = u < p_burned[None, :, :]
+            burning = (u >= p_burned[None, :, :]) & (u < (p_burned + p_burning)[None, :, :])
+
+            burn_remaining_s = np.zeros((n_sims, nx, ny), dtype=float)
+            br_map = br0[0]
+            burn_remaining_s[burning] = np.broadcast_to(br_map, (n_sims, nx, ny))[burning]
+            burn_remaining_s[burned] = 0.0
+
+            ret_map = ret0[0]
+            retardant = np.broadcast_to(ret_map, (n_sims, nx, ny)).copy()
+            state = FireState(burning=burning, burned=burned, burn_remaining_s=burn_remaining_s, retardant=retardant, t=t0)
+
+        self.apply_retardant_cartesian(
+            state,
+            drone_params,
+            drop_w_km=self.env.drop_w_km,
+            drop_h_km=self.env.drop_h_km,
+            amount=self.env.drop_amount,
+        )
+
+        for _ in range(num_steps):
+            self.step_batch(state, ros_mps=ros_mps, wind_coeff=wind_coeff, diag=diag)
+
+        return self.aggregate_mc_to_state(state)
+
+    def plot_firestate(
+        self,
+        state: FireState,
+        *,
+        sim_idx: int = 0,
+        kind: str = "auto",
+        title: str | None = None,
+        extent_km: float | None = None,
+    ):
+        burning = state.burning[sim_idx]
+        burned = state.burned[sim_idx]
+        brs = state.burn_remaining_s[sim_idx]
+
+        is_prob = np.issubdtype(burning.dtype, np.floating) or np.issubdtype(burned.dtype, np.floating)
+        if kind == "auto":
+            kind = "p_affected" if is_prob else "discrete"
+
+        if extent_km is not None:
+            extent = [0, extent_km, 0, extent_km]
+            xlabel, ylabel = "x (km)", "y (km)"
+        else:
+            extent = None
+            xlabel, ylabel = "x cell", "y cell"
+
+        plt.figure(figsize=(6, 5))
+        if kind == "discrete":
+            s = np.zeros_like(burning, dtype=np.int8)
+            s[burning.astype(bool)] = 1
+            s[burned.astype(bool)] = 2
+            im = plt.imshow(s.T, origin="lower", aspect="equal", extent=extent)
+            plt.colorbar(im, ticks=[0, 1, 2], label="State (0=unburned, 1=burning, 2=burned)")
+        elif kind == "p_burning":
+            im = plt.imshow(np.clip(burning, 0, 1).T, origin="lower", vmin=0, vmax=1, aspect="equal", extent=extent)
+            plt.colorbar(im, label="P(burning)")
+        elif kind == "p_burned":
+            im = plt.imshow(np.clip(burned, 0, 1).T, origin="lower", vmin=0, vmax=1, aspect="equal", extent=extent)
+            plt.colorbar(im, label="P(burned)")
+        elif kind == "p_affected":
+            affected = (burning | burned) if (burning.dtype == bool and burned.dtype == bool) else np.clip(burning + burned, 0, 1)
+            im = plt.imshow(affected.T, origin="lower", vmin=0, vmax=1, aspect="equal", extent=extent)
+            plt.colorbar(im, label="P(burning or burned)" if is_prob else "Affected (burning or burned)")
+        elif kind == "burn_remaining":
+            im = plt.imshow(brs.T, origin="lower", aspect="equal", extent=extent)
+            plt.colorbar(im, label="Burn remaining (s)")
+        elif kind == "retardant":
+            r = state.retardant[sim_idx]
+            im = plt.imshow(r.T, origin="lower", aspect="equal", extent=extent)
+            plt.colorbar(im, label="Retardant load")
+        else:
+            raise ValueError(f"Unknown kind={kind}")
+
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.tight_layout()
+        plt.show()
+
+    def state_int_single(self, state: FireState, sim_idx: int = 0) -> np.ndarray:
+        s = np.zeros(state.burning.shape[1:], dtype=np.int8)
+        s[state.burning[sim_idx]] = 1
+        s[state.burned[sim_idx]] = 2
+        return s
+
+    def plot_single_run(self, state: FireState, sim_idx: int = 0, title: str | None = None):
+        s = self.state_int_single(state, sim_idx=sim_idx)
+        plt.figure(figsize=(6, 5))
+        plt.imshow(s.T, origin="lower", aspect="equal")
+        plt.colorbar(ticks=[0, 1, 2], label="State (0=unburned, 1=burning, 2=burned)")
+        plt.xlabel("x cell")
+        plt.ylabel("y cell")
+        plt.title(title if title is not None else f"Fire state at t={state.t}")
+        plt.tight_layout()
+        plt.show()
+
+    def plot_probability_map(
+        self,
+        p_map: np.ndarray,
+        *,
+        title: str | None = None,
+        cbar_label: str = "P(burned by T)",
+        extent_km: bool = True,
+    ):
+        extent = [0, self.env.domain_km, 0, self.env.domain_km] if extent_km else None
+        plt.figure(figsize=(6, 5))
+        im = plt.imshow(p_map.T, origin="lower", vmin=0.0, vmax=1.0, aspect="equal", extent=extent)
+        plt.colorbar(im, label=cbar_label)
+        plt.xlabel("x (km)" if extent_km else "x cell")
+        plt.ylabel("y (km)" if extent_km else "y cell")
+        plt.title(title if title is not None else "Monte Carlo burned probability map")
+        plt.tight_layout()
+        plt.show()
+
+    def generate_search_domain(
+        self,
+        T: float,
+        n_sims: int,
+        *,
+        init_firestate: FireState = None,
+        ros_mps: float = 0.5,
+        wind_coeff: float = 0.50,
+        diag: bool = True,
+        seed: int | None = None,
+        p_boundary: float = 0.25,
+        K: int = 200,
+        boundary_field: str = "affected",
+    ):
+        if init_firestate is None:
+            init_firestate = self.init_state_batch(n_sims=n_sims, center=(50, 50), radius_km=0.2)
+
+        final_firestate = self.simulate_from_firestate(
+            init_firestate,
+            T=T,
+            n_sims=n_sims,
+            drone_params=None,
+            ros_mps=ros_mps,
+            wind_coeff=wind_coeff,
+            diag=diag,
+            seed=seed,
+        )
+
+        init_boundary = self.extract_fire_boundary(
+            init_firestate,
+            K=K,
+            p_boundary=p_boundary,
+            field=boundary_field,
+            anchor="max_x",
+            ccw=True,
+        )
+
+        final_boundary = self.extract_fire_boundary(
+            final_firestate,
+            K=K,
+            p_boundary=p_boundary,
+            field=boundary_field,
+            anchor="max_x",
+            ccw=True,
+        )
+
+        search_domain_mask = self.discretise_between_boundaries(init_boundary, final_boundary)
+        return search_domain_mask
+
+
+__all__ = ["FireEnv", "FireState", "CAFireModel"]
