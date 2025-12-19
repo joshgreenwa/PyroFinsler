@@ -27,6 +27,7 @@ class FireEnv:
     drop_amount: float = 1.0
     ros_mps: float = 0.5
     wind_coeff: float = 0.6
+    slope: np.ndarray | None = None  # optional (nx, ny, 2) slope vectors
     diag: bool = True
 
 

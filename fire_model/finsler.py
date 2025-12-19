@@ -61,6 +61,17 @@ def _wind_at_time(env: FireEnv, t_s: float) -> np.ndarray:
     raise ValueError("env.wind must have shape (nx,ny,2) or (T,nx,ny,2)")
 
 
+def _slope_factor(slope_vec: np.ndarray | None, move_dir: np.ndarray, k_slope: float) -> float:
+    """Multiplicative slope bias; >1 uphill, <1 downhill depending on k_slope."""
+    if slope_vec is None or k_slope == 0.0:
+        return 1.0
+    slope_mag = float(np.linalg.norm(slope_vec))
+    if slope_mag < 1e-12:
+        return 1.0
+    align = float(np.dot(_unit_vec(slope_vec), _unit_vec(move_dir)))
+    return float(np.exp(k_slope * slope_mag * align))
+
+
 def _directional_rate(
     local_ros: float,
     wind_vec: np.ndarray,
@@ -69,6 +80,8 @@ def _directional_rate(
     k_wind: float,
     w_ref: float,
     clamp: tuple[float, float],
+    slope_vec: np.ndarray | None = None,
+    k_slope: float = 0.0,
 ) -> float:
     """Directional rate of spread (m/s) at a cell."""
     wmag = float(np.linalg.norm(wind_vec))
@@ -78,7 +91,8 @@ def _directional_rate(
         align = float(np.dot(_unit_vec(wind_vec), _unit_vec(move_dir)))
 
     wind_factor = np.exp(k_wind * (wmag / (w_ref + 1e-12)) * align)
-    rate = local_ros * wind_factor
+    slope_bias = _slope_factor(slope_vec, move_dir, k_slope)
+    rate = local_ros * wind_factor * slope_bias
 
     lo, hi = clamp
     return float(np.clip(rate, lo * local_ros, hi * local_ros))
@@ -96,6 +110,7 @@ def anisotropic_arrival_times(
     k_wind: float = 0.25,
     w_ref: float = 5.0,
     clamp: tuple[float, float] = (0.05, 5.0),
+    k_slope: float = 0.0,
     retardant0: np.ndarray | None = None,
     start_time_s: float = 0.0,
     retardant_applied_time_s: float = 0.0,
@@ -123,6 +138,12 @@ def anisotropic_arrival_times(
 
     dx_m = _dx_m_from_env(env)
     base_ros = float(env.ros_mps)
+    slope_field = getattr(env, "slope", None)
+    if slope_field is not None:
+        slope_field = np.asarray(slope_field, dtype=float)
+        expected_shape = (*grid_size, 2)
+        if slope_field.shape != expected_shape:
+            raise ValueError(f"env.slope must have shape {expected_shape}, got {slope_field.shape}")
     k_ret = float(getattr(env, "retardant_k", 1.0))
 
     if retardant0 is not None:
@@ -154,6 +175,7 @@ def anisotropic_arrival_times(
 
         wind_field = _wind_at_time(env, abs_time_s)
         wind_vec = wind_field[x, y]
+        slope_vec = None if slope_field is None else slope_field[x, y]
 
         if r0 is None:
             attn = 1.0
@@ -179,6 +201,8 @@ def anisotropic_arrival_times(
                 k_wind=float(k_wind),
                 w_ref=float(w_ref),
                 clamp=clamp,
+                slope_vec=slope_vec,
+                k_slope=float(k_slope),
             )
 
             dt = step_len / max(rate, 1e-9)
@@ -212,12 +236,14 @@ class FinslerFireModel:
         k_wind: float = 0.25,
         w_ref: float = 5.0,
         clamp: tuple[float, float] = (0.05, 5.0),
+        k_slope: float = 0.0,
     ):
         self.env = env
         self.diag = bool(env.diag if diag is None else diag)
         self.k_wind = float(k_wind)
         self.w_ref = float(w_ref)
         self.clamp = clamp
+        self.k_slope = float(k_slope)
 
         self._retardant = np.zeros(env.grid_size, dtype=float)
         self._arrival: np.ndarray | None = None
@@ -291,6 +317,7 @@ class FinslerFireModel:
             k_wind=self.k_wind,
             w_ref=self.w_ref,
             clamp=self.clamp,
+            k_slope=self.k_slope,
             retardant0=self._retardant,
             start_time_s=self._start_time_s,
             retardant_applied_time_s=self._retardant_t0_s,
@@ -349,14 +376,12 @@ class FinslerFireModel:
         T: float,
         drone_params: np.ndarray | None = None,
     ) -> FireState:
-        if self._ignition_mask is None:
-            # Best-effort: infer ignition region from current affected area
-            # (still deterministic, but caller should really init_state(...) first)
-            inner = np.asarray(init_firestate.burning[0], dtype=bool) | np.asarray(init_firestate.burned[0], dtype=bool)
-            self._ignition_mask = inner
-
-        start_t = float(getattr(init_firestate, "t", 0)) * float(self.env.dt_s)
+        start_t = float(getattr(init_firestate, "time_s", float(getattr(init_firestate, "t", 0)) * float(self.env.dt_s)))
         target_t = start_t + float(T)
+
+        burning = np.asarray(init_firestate.burning[0], dtype=bool)
+        front_mask = burning.copy()
+        self._ignition_mask = np.asarray(front_mask, dtype=bool)
 
         self.reset_retardant()
         self._start_time_s = start_t
@@ -364,17 +389,21 @@ class FinslerFireModel:
 
         self.apply_retardant_cartesian(drone_params)
 
-        self._arrival = anisotropic_arrival_times(
-            self.env,
-            self._ignition_mask,
-            diag=self.diag,
-            k_wind=self.k_wind,
-            w_ref=self.w_ref,
-            clamp=self.clamp,
-            retardant0=self._retardant,
-            start_time_s=self._start_time_s,
-            retardant_applied_time_s=self._retardant_t0_s,
-        )
+        if np.any(self._ignition_mask):
+            self._arrival = anisotropic_arrival_times(
+                self.env,
+                self._ignition_mask,
+                diag=self.diag,
+                k_wind=self.k_wind,
+                w_ref=self.w_ref,
+                clamp=self.clamp,
+                k_slope=self.k_slope,
+                retardant0=self._retardant,
+                start_time_s=self._start_time_s,
+                retardant_applied_time_s=self._retardant_t0_s,
+            )
+        elif self._arrival is None:
+            self._arrival = np.full(self.env.grid_size, np.inf, dtype=float)
 
         return self.firestate_at_time(target_t)
 

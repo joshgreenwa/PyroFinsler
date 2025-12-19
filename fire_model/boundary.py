@@ -64,9 +64,14 @@ def extract_fire_boundary(
     else:
         raise ValueError(f"Unknown field={field}")
 
+    plot_field = p.T.astype(float)
+    pad_val = min(float(np.min(plot_field)), float(p_boundary)) - 1.0
+    padded = np.full((plot_field.shape[0] + 2, plot_field.shape[1] + 2), pad_val, dtype=float)
+    padded[1:-1, 1:-1] = plot_field
+
     fig = plt.figure()
     try:
-        CS = plt.contour(p.T, levels=[p_boundary])
+        CS = plt.contour(padded, levels=[p_boundary])
         if hasattr(CS, "allsegs") and len(CS.allsegs) > 0:
             segs = CS.allsegs[0]
         elif hasattr(CS, "collections") and CS.collections:
@@ -81,6 +86,7 @@ def extract_fire_boundary(
         raise ValueError(f"No boundary found for level p_boundary={p_boundary}. Try a different level.")
 
     xy0 = max(segs, key=_polyline_length)
+    xy0 = xy0 - 1.0  # remove padding offset so coordinates align with original grid
 
     if not np.allclose(xy0[0], xy0[-1]):
         xy0 = np.vstack([xy0, xy0[0]])
