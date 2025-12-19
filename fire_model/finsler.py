@@ -375,6 +375,11 @@ class FinslerFireModel:
         *,
         T: float,
         drone_params: np.ndarray | None = None,
+        n_sims: int | None = None,
+        ros_mps: float | None = None,
+        wind_coeff: float | None = None,
+        diag: bool | None = None,
+        seed: int | None = None,
     ) -> FireState:
         start_t = float(getattr(init_firestate, "time_s", float(getattr(init_firestate, "t", 0)) * float(self.env.dt_s)))
         target_t = start_t + float(T)
@@ -458,8 +463,13 @@ class FinslerFireModel:
     def generate_search_domain(
         self,
         T: float,
+        n_sims: int = 1,
         *,
         init_firestate: FireState,
+        ros_mps: float | None = None,
+        wind_coeff: float | None = None,
+        diag: bool | None = None,
+        seed: int | None = None,
         p_boundary: float = 0.5,
         K: int = 200,
         boundary_field: str = "affected",
