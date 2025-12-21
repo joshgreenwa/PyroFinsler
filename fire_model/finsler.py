@@ -380,6 +380,8 @@ class FinslerFireModel:
         wind_coeff: float | None = None,
         diag: bool | None = None,
         seed: int | None = None,
+        avoid_burning_drop: bool = True, #added for compatibility
+        burning_prob_threshold: float = 0.25, #added for compatibility
     ) -> FireState:
         start_t = float(getattr(init_firestate, "time_s", float(getattr(init_firestate, "t", 0)) * float(self.env.dt_s)))
         target_t = start_t + float(T)

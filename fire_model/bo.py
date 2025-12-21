@@ -592,6 +592,8 @@ class RetardantDropBayesOpt:
             wind_coeff=self.fire_model.env.wind_coeff,
             diag=self.fire_model.env.diag,
             seed=None,
+            avoid_burning_drop=self.fire_model.env.avoid_burning_drop,
+            burning_prob_threshold=self.fire_model.env.avoid_drop_p_threshold,
         )
 
         p_burning = evolved_firestate.burning[0].astype(float, copy=False)

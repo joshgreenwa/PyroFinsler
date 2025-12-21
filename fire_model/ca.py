@@ -29,6 +29,8 @@ class FireEnv:
     wind_coeff: float = 0.6
     slope: np.ndarray | None = None  # optional (nx, ny, 2) slope vectors
     diag: bool = True
+    avoid_burning_drop: bool = True  # whether to avoid dropping retardant on burning cells
+    avoid_drop_p_threshold: float = 0.25  # threshold for considering a cell as burning when avoid_burning_drop is True
 
 
 @dataclass
