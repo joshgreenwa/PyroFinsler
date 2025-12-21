@@ -516,6 +516,7 @@ class CAFireModel:
         p_boundary: float = 0.25,
         K: int = 200,
         boundary_field: str = "affected",
+        return_boundaries: bool = False,
     ):
         if init_firestate is None:
             init_firestate = self.init_state_batch(n_sims=n_sims, center=(50, 50), radius_km=0.2)
@@ -550,6 +551,8 @@ class CAFireModel:
         )
 
         search_domain_mask = self.discretise_between_boundaries(init_boundary, final_boundary)
+        if return_boundaries:
+            return search_domain_mask, init_boundary, final_boundary, final_firestate
         return search_domain_mask
 
 
