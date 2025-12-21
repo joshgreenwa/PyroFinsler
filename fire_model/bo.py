@@ -1,6 +1,7 @@
 import numpy as np
 from numpy.random import default_rng
 from scipy.stats import norm
+from scipy.stats import qmc
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Hyperparameter, Matern, WhiteKernel, Kernel
 from scipy.spatial import cKDTree
@@ -257,6 +258,33 @@ class RetardantDropBayesOpt:
             return self.rng.random(self.dim)
         return self.rng.random((n, self.dim))
 
+    def sample_qmc_theta(self, n: int, *, method: str = "sobol") -> np.ndarray:
+        """
+        Low-discrepancy samples in [0,1]^dim (better global coverage than pure random).
+
+        `method` options: 'sobol', 'halton', 'lhs'.
+        """
+        n = int(n)
+        if n <= 0:
+            raise ValueError("n must be >= 1")
+
+        method = str(method).lower().strip()
+        seed = int(self.rng.integers(0, 2**32 - 1))
+
+        if method == "sobol":
+            sampler = qmc.Sobol(d=self.dim, scramble=True, seed=seed)
+            X = sampler.random(n)
+        elif method == "halton":
+            sampler = qmc.Halton(d=self.dim, scramble=True, seed=seed)
+            X = sampler.random(n)
+        elif method in {"lhs", "latin", "latin-hypercube"}:
+            sampler = qmc.LatinHypercube(d=self.dim, seed=seed)
+            X = sampler.random(n)
+        else:
+            raise ValueError("Unknown QMC method. Use 'sobol', 'halton', or 'lhs'.")
+
+        return np.asarray(X, dtype=float)
+
     def sample_random_theta_on_mask(self, n: int = 1):
         """
         Random initialisation that is uniform over valid search cells (instead of uniform over [0,1]^dim
@@ -281,6 +309,65 @@ class RetardantDropBayesOpt:
             thetas[i] = np.clip(theta, 0.0, 1.0)
 
         return thetas[0] if n == 1 else thetas
+
+    def sample_local_theta_on_mask(
+        self,
+        anchors_theta: np.ndarray,
+        n: int,
+        *,
+        sigma_cells: float = 3.0,
+        sigma_phi_rad: float = np.deg2rad(15.0),
+        resample_phi_prob: float = 0.05,
+        resample_xy_prob: float = 0.0,
+    ) -> np.ndarray:
+        """
+        Local refinement candidates around one or more anchors.
+
+        Perturbs in *cell space* then snaps back to the valid mask (more effective than tiny
+        perturbations in [0,1] when `decode_theta` causes discretisation/plateaus).
+        """
+        if self.projector is None or self.shape is None:
+            raise RuntimeError("Call setup_search_grid(...) before local sampling.")
+
+        anchors_theta = np.atleast_2d(np.asarray(anchors_theta, dtype=float))
+        if anchors_theta.shape[0] < 1 or anchors_theta.shape[1] != self.dim:
+            raise ValueError(f"anchors_theta must have shape (*,{self.dim}); got {anchors_theta.shape}")
+
+        nx, ny = self.shape
+        sigma_cells = float(max(sigma_cells, 0.0))
+        sigma_phi_rad = float(max(sigma_phi_rad, 0.0))
+        resample_phi_prob = float(np.clip(resample_phi_prob, 0.0, 1.0))
+        resample_xy_prob = float(np.clip(resample_xy_prob, 0.0, 1.0))
+
+        out = np.empty((max(int(n), 1), self.dim), dtype=float)
+
+        for i in range(out.shape[0]):
+            base = anchors_theta[int(self.rng.integers(0, anchors_theta.shape[0]))]
+            params = self.decode_theta(base)  # (D,3) snapped, sorted
+
+            theta = np.empty(self.dim, dtype=float)
+            for d in range(self.n_drones):
+                x0, y0, phi0 = params[d]
+
+                if float(self.rng.random()) < resample_xy_prob:
+                    xg, yg = self.projector.random_coords(self.rng, 1)[0]
+                else:
+                    x_cont = float(x0) + float(self.rng.normal(0.0, sigma_cells))
+                    y_cont = float(y0) + float(self.rng.normal(0.0, sigma_cells))
+                    xg, yg = self.projector.snap(x_cont, y_cont)
+
+                if float(self.rng.random()) < resample_phi_prob:
+                    phi = float(self.rng.random()) * (2.0 * np.pi)
+                else:
+                    phi = self._wrap_angle(float(phi0) + float(self.rng.normal(0.0, sigma_phi_rad)))
+
+                theta[3 * d + 0] = float(xg) / max(nx - 1, 1)
+                theta[3 * d + 1] = float(yg) / max(ny - 1, 1)
+                theta[3 * d + 2] = float(phi) / (2.0 * np.pi)
+
+            out[i] = np.clip(theta, 0.0, 1.0)
+
+        return out[0] if n == 1 else out
 
     def sample_heuristic_theta(
         self,
@@ -528,9 +615,17 @@ class RetardantDropBayesOpt:
         verbose: bool = True,
         print_every: int = 1,
         use_ard_kernel: bool = False,
-        init_strategy: str = "random", #"random_mask", "heuristic"
-        init_heuristic_random_frac: float = 0.2,
-        init_heuristic_kwargs: dict | None = None,
+        init_strategy: str = "random",  # "random_mask", "heuristic"
+        init_heuristic_random_frac: float = 0.2, # fraction of heuristic init points to random
+        init_heuristic_kwargs: dict | None = None, # passed to sample_heuristic_theta 
+        candidate_strategy: str = "random", # "random_mask", "qmc", "mixed"
+        candidate_qmc: str = "sobol", # "sobol", "halton", "lhs"
+        candidate_global_masked: bool = False, # only for "mixed" strategy (if True: global half is random_mask - cell uniform, else: global half is QMC in [0,1]^dim)
+        candidate_local_frac: float = 0.5, # only for "mixed" strategy (fraction of candidates allocated to local refinment. Higher = more exploitative)
+        candidate_local_top_k: int = 3, # only for "mixed" strategy (number of best points to use as anchors for local refinement)
+        candidate_local_sigma_cells: float = 3.0, # only for "mixed" strategy (stddev of local (x,y) refinements in cell space before snapping to mask)
+        candidate_local_sigma_phi_rad: float = np.deg2rad(15.0), # only for "mixed" strategy (stddev of local phi refinements in radians)
+        candidate_local_resample_phi_prob: float = 0.05, # only for "mixed" strategy (probability of resampling phi locally)
     ):
         if self.projector is None:
             self.setup_search_grid(K=K_grid, boundary_field=boundary_field)
@@ -581,7 +676,37 @@ class RetardantDropBayesOpt:
         for it in range(1, n_iters + 1):
             gp.fit(X, y)
 
-            Xcand_theta = self.sample_random_theta(n_candidates)
+            cstrat = str(candidate_strategy).lower().strip()
+            if cstrat == "mixed":
+                local_frac = float(np.clip(candidate_local_frac, 0.0, 1.0))
+                n_local = int(np.round(n_candidates * local_frac))
+                n_global = int(n_candidates - n_local)
+
+                globals_ = (
+                    self.sample_random_theta_on_mask(n_global)
+                    if candidate_global_masked
+                    else self.sample_qmc_theta(n_global, method=candidate_qmc)
+                )
+
+                top_k = int(np.clip(int(candidate_local_top_k), 1, len(y)))
+                anchor_idx = np.argsort(y)[:top_k]
+                anchors = X_theta[anchor_idx]
+                locals_ = self.sample_local_theta_on_mask(
+                    anchors,
+                    n_local,
+                    sigma_cells=candidate_local_sigma_cells,
+                    sigma_phi_rad=candidate_local_sigma_phi_rad,
+                    resample_phi_prob=candidate_local_resample_phi_prob,
+                )
+
+                Xcand_theta = np.vstack([np.atleast_2d(globals_), np.atleast_2d(locals_)])
+                Xcand_theta = Xcand_theta[self.rng.permutation(Xcand_theta.shape[0])]
+            elif cstrat == "random_mask":
+                Xcand_theta = self.sample_random_theta_on_mask(n_candidates)
+            elif cstrat == "qmc":
+                Xcand_theta = self.sample_qmc_theta(n_candidates, method=candidate_qmc)
+            else:
+                Xcand_theta = self.sample_random_theta(n_candidates)
             Xcand = np.vstack([self.theta_to_gp_features(th) for th in Xcand_theta])
 
             y_best = float(np.min(y))

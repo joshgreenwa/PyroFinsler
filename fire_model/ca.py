@@ -267,6 +267,9 @@ class CAFireModel:
         drop_w_km: float,
         drop_h_km: float,
         amount: float = 1.0,
+        avoid_burning: bool = False, # whether to avoid dropping retardant on burning cells
+        forbid_burning_overlap: bool = False,  # whether to raise value error if drop overlaps burning cells
+        burning_prob_threshold: float = 0.25,  # threshold for considering a cell as burning when avoid_burning is True
     ):
         if drone_params is None:
             return
@@ -283,6 +286,23 @@ class CAFireModel:
         X = np.arange(nx)[:, None]
         Y = np.arange(ny)[None, :]
 
+        burning_union = None
+        if avoid_burning or forbid_burning_overlap:
+            thr = float(burning_prob_threshold)
+            if not (0.0 <= thr <= 1.0):
+                raise ValueError("burning_prob_threshold must be in [0,1].")
+            burning = np.asarray(state.burning)
+            if burning.ndim == 2:
+                burning2d = burning
+            elif burning.ndim == 3:
+                burning2d = burning.any(axis=0)
+            else:
+                raise ValueError(f"state.burning must have shape (nx,ny) or (n_sims,nx,ny); got {burning.shape}")
+            if np.issubdtype(burning2d.dtype, np.floating):
+                burning_union = burning2d > thr
+            else:
+                burning_union = burning2d.astype(bool, copy=False)
+
         for x0, y0, phi in drone_params:
             xp = X - x0
             yp = Y - y0
@@ -294,6 +314,11 @@ class CAFireModel:
             yr = -s * xp + c * yp
 
             mask = (np.abs(xr) <= half_w) & (np.abs(yr) <= half_h)
+            if burning_union is not None:
+                if forbid_burning_overlap and np.any(mask & burning_union):
+                    raise ValueError("Retardant drop overlaps actively burning cells.")
+                if avoid_burning:
+                    mask = mask & (~burning_union)
             state.retardant[:, mask] += amount
 
     def simulate_from_ignition(
@@ -307,6 +332,9 @@ class CAFireModel:
         ros_mps: float = 0.5,
         wind_coeff: float = 0.50,
         diag: bool = True,
+        avoid_burning_drop: bool = True, # whether to avoid dropping retardant on burning cells
+        forbid_burning_overlap: bool = False, # whether to raise value error if drop overlaps burning cells
+        burning_prob_threshold: float = 0.25, # used if burning map is probabilistic
     ) -> np.ndarray:
         state = self.init_state_batch(n_sims=n_sims, center=center, radius_km=radius_km)
         self.apply_retardant_cartesian(
@@ -315,6 +343,9 @@ class CAFireModel:
             drop_w_km=self.env.drop_w_km,
             drop_h_km=self.env.drop_h_km,
             amount=self.env.drop_amount,
+            avoid_burning=avoid_burning_drop,
+            forbid_burning_overlap=forbid_burning_overlap,
+            burning_prob_threshold=burning_prob_threshold,
         )
 
         num_steps = int(T / self.env.dt_s)
@@ -335,6 +366,9 @@ class CAFireModel:
         wind_coeff: float = 0.50,
         diag: bool = True,
         seed: int | None = None,
+        avoid_burning_drop: bool = True, # whether to avoid dropping retardant on burning cells
+        forbid_burning_overlap: bool = False, # whether to raise value error if drop overlaps burning cells
+        burning_prob_threshold: float = 0.25, # if avoid burning is True, threshold for considering a cell as burning
     ) -> FireState:
         nx, ny = self.env.grid_size
         dt_s = float(self.env.dt_s)
@@ -404,6 +438,9 @@ class CAFireModel:
             drop_w_km=self.env.drop_w_km,
             drop_h_km=self.env.drop_h_km,
             amount=self.env.drop_amount,
+            avoid_burning=avoid_burning_drop,
+            forbid_burning_overlap=forbid_burning_overlap,
+            burning_prob_threshold=burning_prob_threshold,
         )
 
         for _ in range(num_steps):
