@@ -494,9 +494,26 @@ class CAFireModel:
         elif kind == "burn_remaining":
             im = plt.imshow(brs.T, origin="lower", aspect="equal", extent=extent)
             plt.colorbar(im, label="Burn remaining (s)")
-        elif kind == "retardant":
+        elif kind == "retardant": #note: overlays value map
             r = state.retardant[sim_idx]
-            im = plt.imshow(r.T, origin="lower", aspect="equal", extent=extent)
+            v = np.asarray(self.env.value, dtype=float)
+
+            plt.imshow(v.T, origin="lower", aspect="equal", extent=extent, cmap="viridis", interpolation="nearest")
+
+            r_max = float(np.max(r)) if np.size(r) else 0.0
+            alpha = np.clip(r / r_max, 0.0, 1.0).T if r_max > 0.0 else 0.0
+
+            im = plt.imshow(
+                r.T,
+                origin="lower",
+                aspect="equal",
+                extent=extent,
+                cmap="Reds",
+                interpolation="nearest",
+                alpha=alpha,
+                vmin=0.0,
+                vmax=max(r_max, 1e-12),
+            )
             plt.colorbar(im, label="Retardant load")
         else:
             raise ValueError(f"Unknown kind={kind}")
