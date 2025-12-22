@@ -806,6 +806,71 @@ class RetardantDropBayesOpt:
 
         return best_theta, best_params, best_y, (X_feats, y_arr), y_nexts, y_bests_arr
 
+    def run_heuristic_search(
+        self,
+        n_evals: int = 50,
+        K_grid: int = 500,
+        boundary_field: str = "affected",
+        *,
+        heuristic_random_frac: float = 0.0,
+        heuristic_kwargs: dict | None = None,
+        verbose: bool = True,
+        print_every: int = 1,
+    ):
+        """
+        Heuristic search baseline (repeatedly sample `sample_heuristic_theta` and keep the best).
+
+        Use this to compare "what the heuristic alone can do" against BO for a fixed evaluation budget.
+        """
+        if self.projector is None:
+            self.setup_search_grid(K=K_grid, boundary_field=boundary_field)
+            if verbose:
+                print(f"[Heuristic] Search grid set up with {len(self.projector.coords)} valid cells in grid.")
+                self.fire_model.plot_search_domain(self.search_domain_mask, title="Current Search Domain:")
+
+        heuristic_kwargs = {} if heuristic_kwargs is None else dict(heuristic_kwargs)
+        thetas = self.sample_initial_thetas(
+            n_init=n_evals,
+            strategy="heuristic",
+            heuristic_random_frac=heuristic_random_frac,
+            heuristic_kwargs=heuristic_kwargs,
+        )
+
+        y_vals: list[float] = []
+        y_bests: list[float] = []
+
+        best_theta = None
+        best_y = float("inf")
+
+        for i, theta in enumerate(thetas, start=1):
+            y_val = float(self.expected_value_burned_area(theta))
+            y_vals.append(y_val)
+
+            if y_val < best_y:
+                best_y = y_val
+                best_theta = theta
+
+            y_bests.append(best_y)
+
+            if verbose and (i % max(print_every, 1) == 0 or i == 1 or i == n_evals):
+                params = self.decode_theta(theta)
+                print(
+                    f"[Heuristic] eval {i:03d}/{n_evals} | y={y_val:.6g} | best={best_y:.6g}\n"
+                    f"           (x,y,phi) per drone:\n           {params}"
+                )
+
+        best_params = self.decode_theta(best_theta)
+        X_feats = np.vstack([self.theta_to_gp_features(th) for th in thetas])
+        y_arr = np.array(y_vals, dtype=float)
+        y_nexts = list(y_vals)
+        y_bests_arr = np.array(y_bests, dtype=float)
+
+        if verbose:
+            print(f"[Heuristic] done: best_y={best_y:.6g}")
+            print(f"[Heuristic] best params:\n{best_params}")
+
+        return best_theta, best_params, best_y, (X_feats, y_arr), y_nexts, y_bests_arr
+
     def plot_evolved_firestate(
         self,
         theta: np.ndarray,
