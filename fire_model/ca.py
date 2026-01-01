@@ -22,6 +22,7 @@ class FireEnv:
     burn_time_s0: float = 600.0
     retardant_half_life_s: float = 1800.0
     retardant_k: float = 1.0
+    retardant_cell_cap: float | None = None  # max retardant stored per cell (None disables cap)
     drop_w_km: float = 0.2
     drop_h_km: float = 1.0
     drop_amount: float = 1.0
@@ -31,6 +32,7 @@ class FireEnv:
     diag: bool = True
     avoid_burning_drop: bool = True  # whether to avoid dropping retardant on burning cells
     avoid_drop_p_threshold: float = 0.25  # threshold for considering a cell as burning when avoid_burning_drop is True
+    control_suitability: np.ndarray | None = None  # optional (nx, ny) suitability map for POD/control heuristics
 
 
 @dataclass
@@ -272,6 +274,7 @@ class CAFireModel:
         avoid_burning: bool = False, # whether to avoid dropping retardant on burning cells
         forbid_burning_overlap: bool = False,  # whether to raise value error if drop overlaps burning cells
         burning_prob_threshold: float = 0.25,  # threshold for considering a cell as burning when avoid_burning is True
+        cell_cap: float | None = None,  # optional cap on accumulated retardant per cell
     ):
         if drone_params is None:
             return
@@ -322,6 +325,9 @@ class CAFireModel:
                 if avoid_burning:
                     mask = mask & (~burning_union)
             state.retardant[:, mask] += amount
+            if cell_cap is not None:
+                capped = np.minimum(state.retardant[:, mask], cell_cap)
+                state.retardant[:, mask] = capped
 
     def simulate_from_ignition(
         self,
@@ -348,6 +354,7 @@ class CAFireModel:
             avoid_burning=avoid_burning_drop,
             forbid_burning_overlap=forbid_burning_overlap,
             burning_prob_threshold=burning_prob_threshold,
+            cell_cap=self.env.retardant_cell_cap,
         )
 
         num_steps = int(T / self.env.dt_s)
@@ -443,6 +450,7 @@ class CAFireModel:
             avoid_burning=avoid_burning_drop,
             forbid_burning_overlap=forbid_burning_overlap,
             burning_prob_threshold=burning_prob_threshold,
+            cell_cap=self.env.retardant_cell_cap,
         )
 
         for _ in range(num_steps):

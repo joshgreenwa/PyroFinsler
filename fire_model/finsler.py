@@ -267,6 +267,7 @@ class FinslerFireModel:
         drop_w_km: float | None = None,
         drop_h_km: float | None = None,
         amount: float | None = None,
+        cell_cap: float | None = None,
     ):
         if drone_params is None:
             return
@@ -280,6 +281,7 @@ class FinslerFireModel:
         drop_w_km = float(drop_w_km if drop_w_km is not None else env.drop_w_km)
         drop_h_km = float(drop_h_km if drop_h_km is not None else env.drop_h_km)
         amount = float(amount if amount is not None else env.drop_amount)
+        cell_cap = cell_cap if cell_cap is not None else env.retardant_cell_cap
 
         nx, ny = env.grid_size
         cell_km = float(env.domain_km) / max(nx, 1)
@@ -298,6 +300,9 @@ class FinslerFireModel:
             yr = -s * xp + c * yp
             mask = (np.abs(xr) <= half_w) & (np.abs(yr) <= half_h)
             self._retardant[mask] += amount
+            if cell_cap is not None:
+                capped = np.minimum(self._retardant[mask], cell_cap)
+                self._retardant[mask] = capped
 
     def init_state(self, *, center, radius_km: float):
         cx, cy = center
@@ -414,6 +419,80 @@ class FinslerFireModel:
 
         return self.firestate_at_time(target_t)
 
+    def plot_firestate(
+        self,
+        state: FireState,
+        *,
+        sim_idx: int = 0,
+        kind: str = "auto",
+        title: str | None = None,
+        extent_km: float | None = None,
+    ):
+        burning = state.burning[sim_idx]
+        burned = state.burned[sim_idx]
+        brs = state.burn_remaining_s[sim_idx]
+
+        is_prob = np.issubdtype(burning.dtype, np.floating) or np.issubdtype(burned.dtype, np.floating)
+        if kind == "auto":
+            kind = "p_affected" if is_prob else "discrete"
+
+        if extent_km is not None:
+            extent = [0, extent_km, 0, extent_km]
+            xlabel, ylabel = "x (km)", "y (km)"
+        else:
+            extent = None
+            xlabel, ylabel = "x cell", "y cell"
+
+        plt.figure(figsize=(6, 5))
+        if kind == "discrete":
+            s = np.zeros_like(burning, dtype=np.int8)
+            s[burning.astype(bool)] = 1
+            s[burned.astype(bool)] = 2
+            im = plt.imshow(s.T, origin="lower", aspect="equal", extent=extent)
+            plt.colorbar(im, ticks=[0, 1, 2], label="State (0=unburned, 1=burning, 2=burned)")
+        elif kind == "p_burning":
+            im = plt.imshow(np.clip(burning, 0, 1).T, origin="lower", vmin=0, vmax=1, aspect="equal", extent=extent)
+            plt.colorbar(im, label="P(burning)")
+        elif kind == "p_burned":
+            im = plt.imshow(np.clip(burned, 0, 1).T, origin="lower", vmin=0, vmax=1, aspect="equal", extent=extent)
+            plt.colorbar(im, label="P(burned)")
+        elif kind == "p_affected":
+            affected = (burning | burned) if (burning.dtype == bool and burned.dtype == bool) else np.clip(burning + burned, 0, 1)
+            im = plt.imshow(affected.T, origin="lower", vmin=0, vmax=1, aspect="equal", extent=extent)
+            plt.colorbar(im, label="P(burning or burned)" if is_prob else "Affected (burning or burned)")
+        elif kind == "burn_remaining":
+            im = plt.imshow(brs.T, origin="lower", aspect="equal", extent=extent)
+            plt.colorbar(im, label="Burn remaining (s)")
+        elif kind == "retardant":  # note: overlays value map
+            r = state.retardant[sim_idx]
+            v = np.asarray(self.env.value, dtype=float)
+
+            plt.imshow(v.T, origin="lower", aspect="equal", extent=extent, cmap="viridis", interpolation="nearest")
+
+            r_max = float(np.max(r)) if np.size(r) else 0.0
+            alpha = np.clip(r / r_max, 0.0, 1.0).T if r_max > 0.0 else 0.0
+
+            im = plt.imshow(
+                r.T,
+                origin="lower",
+                aspect="equal",
+                extent=extent,
+                cmap="Reds",
+                interpolation="nearest",
+                alpha=alpha,
+                vmin=0.0,
+                vmax=max(r_max, 1e-12),
+            )
+            plt.colorbar(im, label="Retardant load")
+        else:
+            raise ValueError(f"Unknown kind={kind}")
+
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.tight_layout()
+        plt.show()
+
     # ---- Boundary utilities ----
 
     def extract_fire_boundary(
@@ -475,10 +554,12 @@ class FinslerFireModel:
         p_boundary: float = 0.5,
         K: int = 200,
         boundary_field: str = "affected",
+        return_boundaries: bool = False,
     ) -> np.ndarray:
         """
         Deterministic search domain between two fronts.
-        Works for bool or float FireState fields.
+        Works for bool or float FireState fields. When `return_boundaries=True` the
+        initial/final boundaries plus the evolved state are also returned (for BO tooling).
         """
         final_state = self.simulate_from_firestate(init_firestate, T=T, drone_params=None)
 
@@ -492,6 +573,9 @@ class FinslerFireModel:
         )
 
         ring_mask = outer_mask & (~inner_mask)
+
+        init_boundary = None
+        final_boundary = None
 
         try:
             init_boundary = self.extract_fire_boundary(
@@ -515,10 +599,15 @@ class FinslerFireModel:
             boundary_mask = np.zeros(self.env.grid_size, dtype=bool)
 
         if ring_mask.any():
-            return ring_mask
-        if boundary_mask.any():
-            return boundary_mask
-        return outer_mask
+            mask = ring_mask
+        elif boundary_mask.any():
+            mask = boundary_mask
+        else:
+            mask = outer_mask
+
+        if return_boundaries:
+            return mask, init_boundary, final_boundary, final_state
+        return mask
 
 
 __all__ = ["FinslerFireModel", "anisotropic_arrival_times", "FinslerResult"]

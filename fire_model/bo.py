@@ -174,6 +174,7 @@ class RetardantDropBayesOpt:
         self.shape = None
         self.init_boundary: FireBoundary | None = None
         self.final_boundary: FireBoundary | None = None
+        self.final_search_firestate: FireState | None = None
 
     @staticmethod
     def _unit(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -238,9 +239,10 @@ class RetardantDropBayesOpt:
             boundary_field=boundary_field,
             return_boundaries=True,
         )
-        search_domain_mask, init_boundary, final_boundary, _final_firestate = search
+        search_domain_mask, init_boundary, final_boundary, final_state = search
         self.init_boundary = init_boundary
         self.final_boundary = final_boundary
+        self.final_search_firestate = final_state
 
         xs, ys = np.where(search_domain_mask)
         coords = np.stack([xs.astype(float), ys.astype(float)], axis=1)
@@ -309,6 +311,428 @@ class RetardantDropBayesOpt:
             thetas[i] = np.clip(theta, 0.0, 1.0)
 
         return thetas[0] if n == 1 else thetas
+
+    def _random_params_on_mask(self, count: int) -> np.ndarray:
+        """
+        Utility that mirrors `sample_random_theta_on_mask` but returns snapped (x,y,phi) tuples.
+        """
+        count = int(max(count, 0))
+        if count == 0:
+            return np.empty((0, 3), dtype=float)
+        if self.projector is None:
+            raise RuntimeError("Call setup_search_grid(...) before sampling.")
+        coords = self.projector.random_coords(self.rng, count)
+        phis = self.rng.random(count) * (2.0 * np.pi)
+        params = np.column_stack([coords, phis])
+        return params
+
+    def _normalize_field(self, values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        if values.size == 0:
+            return values
+        vmin = float(np.min(values))
+        vmax = float(np.max(values))
+        if vmax <= vmin + 1e-12:
+            return np.zeros_like(values, dtype=float)
+        return (values - vmin) / (vmax - vmin)
+
+    def _sample_map_along(
+        self,
+        field_map: np.ndarray | None,
+        inner_xy: np.ndarray,
+        directions: np.ndarray,
+        *,
+        alpha: float,
+    ) -> np.ndarray:
+        if field_map is None:
+            return np.zeros(inner_xy.shape[0], dtype=float)
+
+        fmap = np.asarray(field_map, dtype=float)
+        if fmap.shape != self.shape:
+            raise ValueError(f"Field map shape {fmap.shape} does not match grid {self.shape}.")
+
+        alpha = float(alpha)
+        pts = inner_xy + alpha * directions
+        nx, ny = self.shape
+        xi = np.clip(np.round(pts[:, 0]).astype(int), 0, nx - 1)
+        yi = np.clip(np.round(pts[:, 1]).astype(int), 0, ny - 1)
+        vals = fmap[xi, yi]
+        return self._normalize_field(vals)
+
+    def _build_heuristic_context(
+        self,
+        *,
+        control_map: np.ndarray | None = None,
+        score_alpha: float = 0.6,
+    ) -> dict:
+        if any(x is None for x in (self.projector, self.shape, self.init_boundary, self.final_boundary)):
+            raise RuntimeError("Search grid not initialised; call setup_search_grid(...) first.")
+
+        inner_xy = np.asarray(self.init_boundary.xy, dtype=float)
+        outer_xy = np.asarray(self.final_boundary.xy, dtype=float)
+        if inner_xy.shape != outer_xy.shape:
+            raise ValueError("Boundary point counts do not match; rerun setup_search_grid.")
+
+        v_out = outer_xy - inner_xy
+        tangents = np.roll(inner_xy, -1, axis=0) - np.roll(inner_xy, 1, axis=0)
+        tangent_norm = np.linalg.norm(tangents, axis=1, keepdims=True) + 1e-9
+        tangents_unit = tangents / tangent_norm
+        v_norm = np.linalg.norm(v_out, axis=1, keepdims=True) + 1e-9
+        v_unit = v_out / v_norm
+        normals = np.stack([-tangents_unit[:, 1], tangents_unit[:, 0]], axis=1)
+
+        w_mean = self._estimate_mean_wind()
+        w_mag = float(np.linalg.norm(w_mean))
+        wind_unit = self._unit(w_mean)
+
+        env = self.fire_model.env
+        value_map = np.asarray(env.value, dtype=float)
+        ctrl_map = control_map
+        if ctrl_map is None:
+            ctrl_map = getattr(env, "control_suitability", None)
+        ctrl_map = None if ctrl_map is None else np.asarray(ctrl_map, dtype=float)
+        if ctrl_map is not None and ctrl_map.shape != self.shape:
+            raise ValueError("control_suitability map must match grid size.")
+
+        score_alpha = float(np.clip(score_alpha, 0.0, 1.0))
+        value_scores = self._sample_map_along(value_map, inner_xy, v_out, alpha=score_alpha)
+        control_scores = self._sample_map_along(ctrl_map, inner_xy, v_out, alpha=score_alpha) if ctrl_map is not None else np.zeros_like(value_scores)
+
+        init_burning = np.asarray(self.init_firestate.burning, dtype=float)
+        init_burned = np.asarray(self.init_firestate.burned, dtype=float)
+        if init_burning.ndim == 3:
+            init_burning = init_burning[0]
+        if init_burned.ndim == 3:
+            init_burned = init_burned[0]
+        p_init = np.clip(init_burning + init_burned, 0.0, 1.0)
+
+        final_state = self.final_search_firestate
+        if final_state is not None:
+            p_fin = np.asarray(final_state.burning[0], dtype=float) + np.asarray(final_state.burned[0], dtype=float)
+            p_final = np.clip(p_fin, 0.0, 1.0)
+        else:
+            p_final = np.zeros(self.shape, dtype=float)
+
+        coords = np.indices(self.shape)
+        total_w = p_init.sum()
+        if total_w > 1e-9:
+            cx = float((coords[0] * p_init).sum() / total_w)
+            cy = float((coords[1] * p_init).sum() / total_w)
+        else:
+            cx = float(self.shape[0] / 2.0)
+            cy = float(self.shape[1] / 2.0)
+
+        boundary_tree = cKDTree(outer_xy) if outer_xy.size > 0 else None
+
+        context = {
+            "inner_xy": inner_xy,
+            "outer_xy": outer_xy,
+            "v_out": v_out,
+            "v_unit": v_unit,
+            "tangents": tangents_unit,
+            "normals": normals,
+            "wind_unit": wind_unit,
+            "wind_mag": w_mag,
+            "value_map": value_map,
+            "value_scores": value_scores,
+            "control_scores": control_scores,
+            "control_map": ctrl_map,
+            "p_init": p_init,
+            "p_final": p_final,
+            "init_centroid": np.array([cx, cy], dtype=float),
+            "boundary_tree": boundary_tree,
+            "search_mask": self.search_domain_mask,
+            "score_alpha": score_alpha,
+        }
+        return context
+
+    def _resolve_mode_counts(self, total: int, modes: list[str], allocations: dict | None) -> dict[str, int]:
+        total = int(max(total, 0))
+        if total == 0 or not modes:
+            return {m: 0 for m in modes}
+        weights = []
+        if allocations:
+            for m in modes:
+                weights.append(max(float(allocations.get(m, 0.0)), 0.0))
+        if not allocations or sum(weights) <= 0.0:
+            weights = [1.0] * len(modes)
+        total_w = float(sum(weights))
+        desired = [w / total_w * total for w in weights]
+        counts = {modes[i]: int(np.floor(desired[i])) for i in range(len(modes))}
+        assigned = int(sum(counts.values()))
+        remainders = sorted(
+            ((desired[i] - np.floor(desired[i]), i) for i in range(len(modes))),
+            reverse=True,
+        )
+        idx = 0
+        while assigned < total and idx < len(remainders):
+            _, i = remainders[idx]
+            counts[modes[i]] += 1
+            assigned += 1
+            idx += 1
+        i = 0
+        while assigned < total and i < len(modes):
+            counts[modes[i]] += 1
+            assigned += 1
+            i += 1
+        return counts
+
+    def _heuristic_boundary(
+        self,
+        count: int,
+        ctx: dict,
+        *,
+        alpha_range: tuple[float, float],
+        wind_bias: float,
+        value_bias: float,
+        control_bias: float,
+        min_arc_sep_frac: float,
+        wind_long_axis_blend: float,
+        phi_jitter_rad: float,
+        allowed_idx: np.ndarray | None = None,
+    ) -> list[list[float]]:
+        if count <= 0:
+            return []
+        inner_xy = ctx["inner_xy"]
+        v_out = ctx["v_out"]
+        tangents = ctx["tangents"]
+        value_scores = ctx["value_scores"]
+        control_scores = ctx["control_scores"]
+        K = inner_xy.shape[0]
+        idx_pool = np.arange(K, dtype=int) if allowed_idx is None else np.asarray(allowed_idx, dtype=int)
+        if idx_pool.size == 0:
+            return []
+
+        scores = np.zeros(K, dtype=float)
+        scores[idx_pool] = 1.0
+
+        w_unit = ctx["wind_unit"]
+        if ctx["wind_mag"] > 1e-9 and float(wind_bias) != 0.0:
+            align = ctx["v_unit"] @ w_unit
+            s = np.exp(np.clip(float(wind_bias) * np.clip(align, -1.0, 1.0), -20.0, 20.0))
+            scores *= s
+
+        if float(value_bias) != 0.0:
+            s = np.exp(np.clip(float(value_bias) * value_scores, -20.0, 20.0))
+            scores *= s
+
+        if float(control_bias) != 0.0:
+            s = np.exp(np.clip(float(control_bias) * control_scores, -20.0, 20.0))
+            scores *= s
+
+        min_arc = int(np.clip(np.floor(float(min_arc_sep_frac) * (K / max(self.n_drones, 1))), 1, max(K // 2, 1)))
+        lo, hi = alpha_range
+        lo = float(np.clip(lo, 0.0, 1.0))
+        hi = float(np.clip(hi, 0.0, 1.0))
+        if hi < lo:
+            lo, hi = hi, lo
+
+        placements: list[list[float]] = []
+        available = scores > 0.0
+        for _ in range(count):
+            w = np.where(available, scores, 0.0)
+            if float(w.sum()) <= 0.0:
+                w = available.astype(float)
+            if float(w.sum()) <= 0.0:
+                idx = int(self.rng.choice(idx_pool))
+            else:
+                p = w / float(w.sum())
+                idx = int(self.rng.choice(K, p=p))
+            available[idx] = False
+            for off in range(-min_arc, min_arc + 1):
+                available[(idx + off) % K] = False
+
+            p0 = inner_xy[idx]
+            v = v_out[idx]
+            if float(np.linalg.norm(v)) <= 1e-9:
+                v = np.array([1.0, 0.0], dtype=float)
+            alpha = float(self.rng.uniform(lo, hi))
+            cand = p0 + alpha * v
+            xg, yg = self.projector.snap(float(cand[0]), float(cand[1]))
+
+            t = tangents[idx]
+            u_long = self._unit(t)
+            if wind_long_axis_blend > 0.0 and ctx["wind_mag"] > 1e-9:
+                u_wperp = self._unit(np.array([-w_unit[1], w_unit[0]], dtype=float))
+                u_mix = (1.0 - wind_long_axis_blend) * u_long + wind_long_axis_blend * u_wperp
+                if float(np.linalg.norm(u_mix)) > 1e-9:
+                    u_long = self._unit(u_mix)
+
+            long_angle = float(np.arctan2(u_long[1], u_long[0]))
+            phi = self._phi_from_long_axis_angle(long_angle)
+            if phi_jitter_rad > 0.0:
+                phi = self._wrap_angle(phi + float(self.rng.normal(0.0, phi_jitter_rad)))
+
+            placements.append([xg, yg, phi])
+
+        return placements
+
+    def _heuristic_point_protection(
+        self,
+        count: int,
+        ctx: dict,
+        *,
+        offset_cells: float,
+        exclusion_cells: float,
+        asset_wind_blend: float,
+        min_value_quantile: float,
+    ) -> list[list[float]]:
+        if count <= 0:
+            return []
+        value_map = ctx["value_map"]
+        nx, ny = value_map.shape
+        flat = value_map.ravel()
+        if float(np.max(flat)) <= 0.0:
+            return []
+        quantile = float(np.clip(min_value_quantile, 0.0, 1.0))
+        thresh = np.quantile(flat, quantile) if quantile > 0.0 else np.min(flat)
+        order = np.argsort(flat)[::-1]
+        centers: list[np.ndarray] = []
+        placements: list[list[float]] = []
+        fire_center = ctx["init_centroid"]
+        wind_unit = ctx["wind_unit"]
+        asset_wind_blend = float(np.clip(asset_wind_blend, 0.0, 1.0))
+        offset_cells = float(max(offset_cells, 0.0))
+
+        for idx in order:
+            if len(placements) >= count:
+                break
+            val = flat[idx]
+            if val < thresh:
+                break
+            xi, yi = np.unravel_index(int(idx), (nx, ny))
+            pos = np.array([float(xi), float(yi)], dtype=float)
+            if any(np.linalg.norm(pos - c) < exclusion_cells for c in centers):
+                continue
+
+            fire_vec = self._unit(pos - fire_center)
+            approach = self._unit(asset_wind_blend * wind_unit + (1.0 - asset_wind_blend) * fire_vec)
+            if float(np.linalg.norm(approach)) <= 1e-9:
+                approach = np.array([0.0, 1.0], dtype=float)
+            target = pos - approach * offset_cells
+            xg, yg = self.projector.snap(float(target[0]), float(target[1]))
+            long_axis = np.array([-approach[1], approach[0]], dtype=float)
+            phi = self._phi_from_long_axis_angle(float(np.arctan2(long_axis[1], long_axis[0])))
+            placements.append([xg, yg, phi])
+            centers.append(pos)
+
+        return placements
+
+    def _heuristic_head_flank(
+        self,
+        count: int,
+        ctx: dict,
+        *,
+        head_frac: float,
+        flank_frac: float,
+        back_frac: float,
+        alpha_range: tuple[float, float],
+        **boundary_kwargs,
+    ) -> list[list[float]]:
+        if count <= 0:
+            return []
+        wind_unit = ctx["wind_unit"]
+        v_unit = ctx["v_unit"]
+        align = v_unit @ wind_unit
+        head_idx = np.where(align >= 0.5)[0]
+        back_idx = np.where(align <= -0.3)[0]
+        flank_idx = np.where((np.abs(align) < 0.5))[0]
+        modes = ["head", "flank", "back"]
+        allocs = {"head": head_frac, "flank": flank_frac, "back": back_frac}
+        counts = self._resolve_mode_counts(count, modes, allocs)
+
+        placements: list[list[float]] = []
+        pools = {"head": head_idx, "flank": flank_idx, "back": back_idx}
+        surplus = 0
+        for mode in modes:
+            if pools[mode].size == 0:
+                surplus += counts.get(mode, 0)
+                counts[mode] = 0
+        for mode in modes:
+            if surplus <= 0:
+                break
+            if pools[mode].size > 0:
+                counts[mode] += surplus
+                surplus = 0
+        for mode in modes:
+            c = counts.get(mode, 0)
+            if c <= 0:
+                continue
+            allowed_idx = pools[mode]
+            placements.extend(
+                self._heuristic_boundary(
+                    c,
+                    ctx,
+                    alpha_range=alpha_range,
+                    allowed_idx=allowed_idx,
+                    **boundary_kwargs,
+                )
+            )
+        return placements
+
+    def _heuristic_confine(
+        self,
+        count: int,
+        ctx: dict,
+        *,
+        offset_cells: float,
+    ) -> list[list[float]]:
+        if count <= 0:
+            return []
+        outer = ctx["outer_xy"]
+        if outer.shape[0] < 4:
+            return []
+        center = np.mean(outer, axis=0)
+        centered = outer - center
+        cov = np.cov(centered.T)
+        evals, evecs = np.linalg.eigh(cov)
+        order = np.argsort(evals)
+        long_vec = self._unit(evecs[:, order[-1]])
+        short_vec = self._unit(evecs[:, order[0]])
+        scale = float(np.sqrt(max(evals[order[-1]], 1e-6)))
+        t_vals = np.linspace(-1.0, 1.0, num=max(count, 1))
+        placements: list[list[float]] = []
+        offset_cells = float(offset_cells)
+        for i, t in enumerate(t_vals[:count]):
+            base = center + long_vec * (t * scale)
+            direction = short_vec * ((-1) ** i) * offset_cells
+            pt = base + direction
+            xg, yg = self.projector.snap(float(pt[0]), float(pt[1]))
+            phi = self._phi_from_long_axis_angle(float(np.arctan2(short_vec[1], short_vec[0])))
+            placements.append([xg, yg, phi])
+        return placements
+
+    def _apply_effective_filter(
+        self,
+        params: np.ndarray,
+        ctx: dict,
+        *,
+        min_final_prob: float,
+        max_initial_prob: float,
+        max_boundary_dist: float | None,
+    ) -> np.ndarray:
+        if params.size == 0:
+            return params
+        p_final = ctx["p_final"]
+        p_init = ctx["p_init"]
+        tree = ctx["boundary_tree"]
+        keep = []
+        nx, ny = self.shape
+        for p in params:
+            xi = int(np.clip(round(p[0]), 0, nx - 1))
+            yi = int(np.clip(round(p[1]), 0, ny - 1))
+            if p_final[xi, yi] < min_final_prob:
+                continue
+            if p_init[xi, yi] > max_initial_prob:
+                continue
+            if tree is not None and max_boundary_dist is not None:
+                dist, _ = tree.query([p[0], p[1]])
+                if dist > max_boundary_dist:
+                    continue
+            keep.append(p)
+        if not keep:
+            return np.empty((0, 3), dtype=float)
+        return np.asarray(keep, dtype=float)
 
     def sample_local_theta_on_mask(
         self,
@@ -379,122 +803,188 @@ class RetardantDropBayesOpt:
         wind_long_axis_blend: float = 0.25,
         phi_jitter_rad: float = np.deg2rad(10.0),
         min_arc_sep_frac: float = 0.25,
+        heuristic_modes: list[str] | tuple[str, ...] | None = None,
+        heuristic_allocations: dict | None = None,
+        control_map: np.ndarray | None = None,
+        control_bias: float = 2.0,
+        contingency_alpha_range: tuple[float, float] = (0.65, 0.95),
+        point_offset_cells: float = 4.0,
+        point_exclusion_cells: float = 6.0,
+        point_asset_wind_blend: float = 0.5,
+        point_value_quantile: float = 0.85,
+        head_frac: float = 0.4,
+        flank_frac: float = 0.4,
+        back_frac: float = 0.2,
+        confine_offset_cells: float = 3.0,
+        effective_min_final_prob: float = 0.2,
+        effective_max_init_prob: float = 0.7,
+        effective_max_boundary_dist: float | None = 6.0,
+        score_alpha: float = 0.6,
     ):
         """
-        Heuristic initialisation for (x,y,phi) per drone:
-          - choose points along the *current* fire boundary, biased toward the downwind-facing front
-          - place drops ahead of the front inside the search ring using nearest-point mapping to the outer boundary
-          - orient the retardant line approximately tangent to the boundary (optionally blended with cross-wind)
+        Rich heuristic initialisation that can combine multiple strategies:
+          - boundary-based (wind-aware / value-aware, original behaviour)
+          - POD/control-feature tie-in (control map biasing)
+          - contingency-line allocation
+          - point/zone protection from the value map
+          - head/flank/back region allocation using wind alignment
+          - confine-future-footprint placements using PCA of the outer boundary
+          - effective-interaction filtering to reject implausible drops
+
+        `heuristic_modes` controls which strategies are active (names are case-insensitive).
         """
-        if self.projector is None or self.shape is None:
-            raise RuntimeError("Call setup_search_grid(...) before heuristic sampling.")
-        if self.init_boundary is None or self.final_boundary is None:
-            raise RuntimeError("Search boundaries not available; call setup_search_grid(...) first.")
+        ctx = self._build_heuristic_context(control_map=control_map, score_alpha=score_alpha)
+        default_modes = [
+            "control_tie_in",
+            "point_protection",
+            "contingency",
+            "head_flank",
+            "confine",
+            "boundary",
+            "effective_interaction",
+        ]
+        modes = heuristic_modes if heuristic_modes is not None else default_modes
+        modes = [str(m).lower().strip() for m in modes if str(m).strip()]
+        if not modes:
+            modes = ["boundary"]
 
-        nx, ny = self.shape
-        inner_xy = np.asarray(self.init_boundary.xy, dtype=float)
-        outer_xy = np.asarray(self.final_boundary.xy, dtype=float)
-        if inner_xy.ndim != 2 or inner_xy.shape[1] != 2:
-            raise ValueError(f"init_boundary.xy must have shape (K,2); got {inner_xy.shape}")
-        if outer_xy.ndim != 2 or outer_xy.shape[1] != 2:
-            raise ValueError(f"final_boundary.xy must have shape (K,2); got {outer_xy.shape}")
+        effective_enabled = "effective_interaction" in modes
+        generator_modes = [m for m in modes if m != "effective_interaction"]
+        if not generator_modes:
+            generator_modes = ["boundary"]
+        counts = self._resolve_mode_counts(self.n_drones, list(generator_modes), heuristic_allocations or {})
+        assigned = sum(counts.values())
+        if assigned < self.n_drones:
+            counts["boundary"] = counts.get("boundary", 0) + (self.n_drones - assigned)
+            if "boundary" not in generator_modes:
+                generator_modes.append("boundary")
 
-        K = inner_xy.shape[0]
-        if K < max(8, 2 * self.n_drones):
-            return self.sample_random_theta_on_mask(n=n)
+        base_boundary_kwargs = dict(
+            alpha_range=alpha_range,
+            wind_bias=wind_bias,
+            value_bias=value_bias,
+            min_arc_sep_frac=min_arc_sep_frac,
+            wind_long_axis_blend=float(np.clip(wind_long_axis_blend, 0.0, 1.0)),
+            phi_jitter_rad=float(max(phi_jitter_rad, 0.0)),
+        )
 
-        outer_tree = cKDTree(outer_xy)
-        _, nn_idx = outer_tree.query(inner_xy, k=1)
-        v_out = outer_xy[nn_idx] - inner_xy
+        n = max(int(n), 1)
+        thetas = np.empty((n, self.dim), dtype=float)
 
-        inner_prev = np.roll(inner_xy, 1, axis=0)
-        inner_next = np.roll(inner_xy, -1, axis=0)
-        tangents = inner_next - inner_prev
-
-        w_mean = self._estimate_mean_wind()
-        wmag = float(np.linalg.norm(w_mean))
-        w_unit = self._unit(w_mean) if wmag > 1e-9 else np.zeros(2, dtype=float)
-
-        v_unit = np.array([self._unit(v) for v in v_out])
-        align = v_unit @ w_unit if wmag > 1e-9 else np.zeros(K, dtype=float)
-        scores = np.exp(float(wind_bias) * np.clip(align, -1.0, 1.0))
-
-        value_bias = float(value_bias)
-        if value_bias != 0.0:
-            val_map = np.asarray(self.fire_model.env.value, dtype=float)
-            alpha_mid = 0.6
-            mid = inner_xy + alpha_mid * v_out
-            xi = np.clip(np.round(mid[:, 0]).astype(int), 0, nx - 1)
-            yi = np.clip(np.round(mid[:, 1]).astype(int), 0, ny - 1)
-            vals = val_map[xi, yi]
-            vmin, vmax = float(np.min(vals)), float(np.max(vals))
-            if vmax > vmin + 1e-12:
-                vals = (vals - vmin) / (vmax - vmin)
-            else:
-                vals = np.zeros_like(vals, dtype=float)
-            scores = scores * np.exp(value_bias * vals)
-
-        arc_sep = int(np.clip(np.floor(float(min_arc_sep_frac) * (K / max(self.n_drones, 1))), 1, max(K // 2, 1)))
-        alpha_lo, alpha_hi = alpha_range
-        alpha_lo, alpha_hi = float(alpha_lo), float(alpha_hi)
-        if not (0.0 <= alpha_lo <= alpha_hi <= 1.0):
-            raise ValueError("alpha_range must satisfy 0 <= lo <= hi <= 1.")
-
-        wind_long_axis_blend = float(np.clip(wind_long_axis_blend, 0.0, 1.0))
-        phi_jitter_rad = float(max(phi_jitter_rad, 0.0))
-
-        thetas = np.empty((max(n, 1), self.dim), dtype=float)
-
-        for i in range(max(n, 1)):
-            available = np.ones(K, dtype=bool)
-            chosen: list[int] = []
-
-            for _d in range(self.n_drones):
-                w = np.where(available, scores, 0.0)
-                if float(w.sum()) <= 0.0:
-                    w = available.astype(float)
-                if float(w.sum()) <= 0.0:
-                    chosen.append(int(self.rng.integers(0, K)))
+        for i in range(n):
+            placements: list[list[float]] = []
+            for mode in generator_modes:
+                cnt = counts.get(mode, 0)
+                if cnt <= 0:
+                    continue
+                if mode == "boundary":
+                    placements.extend(self._heuristic_boundary(cnt, ctx, control_bias=0.0, **base_boundary_kwargs))
+                elif mode == "control_tie_in":
+                    placements.extend(
+                        self._heuristic_boundary(
+                            cnt,
+                            ctx,
+                            control_bias=control_bias,
+                            **base_boundary_kwargs,
+                        )
+                    )
+                elif mode == "contingency":
+                    placements.extend(
+                        self._heuristic_boundary(
+                            cnt,
+                            ctx,
+                            alpha_range=contingency_alpha_range,
+                            control_bias=control_bias,
+                            **base_boundary_kwargs,
+                        )
+                    )
+                elif mode == "point_protection":
+                    placements.extend(
+                        self._heuristic_point_protection(
+                            cnt,
+                            ctx,
+                            offset_cells=point_offset_cells,
+                            exclusion_cells=point_exclusion_cells,
+                            asset_wind_blend=point_asset_wind_blend,
+                            min_value_quantile=point_value_quantile,
+                        )
+                    )
+                elif mode == "head_flank":
+                    placements.extend(
+                        self._heuristic_head_flank(
+                            cnt,
+                            ctx,
+                            head_frac=head_frac,
+                            flank_frac=flank_frac,
+                            back_frac=back_frac,
+                            alpha_range=alpha_range,
+                            **base_boundary_kwargs,
+                        )
+                    )
+                elif mode == "confine":
+                    placements.extend(
+                        self._heuristic_confine(
+                            cnt,
+                            ctx,
+                            offset_cells=confine_offset_cells,
+                        )
+                    )
                 else:
-                    p = w / float(w.sum())
-                    chosen.append(int(self.rng.choice(K, p=p)))
+                    # Unknown mode fallback: boundary drop.
+                    placements.extend(self._heuristic_boundary(cnt, ctx, control_bias=0.0, **base_boundary_kwargs))
 
-                idx0 = chosen[-1]
-                for off in range(-arc_sep, arc_sep + 1):
-                    available[(idx0 + off) % K] = False
-                if (not available.any()) and (len(chosen) < self.n_drones):
-                    available[:] = True
+            if len(placements) < self.n_drones:
+                fallback = self._heuristic_boundary(self.n_drones - len(placements), ctx, control_bias=0.0, **base_boundary_kwargs)
+                placements.extend(fallback)
 
-            theta = np.empty(self.dim, dtype=float)
-            for d, idx in enumerate(chosen):
-                p0 = inner_xy[idx]
-                v = v_out[idx]
-                if float(np.linalg.norm(v)) <= 1e-9:
-                    v = np.array([1.0, 0.0], dtype=float)
+            if not placements:
+                params = self._random_params_on_mask(self.n_drones)
+            else:
+                params = np.asarray(placements, dtype=float)
 
-                alpha = float(self.rng.uniform(alpha_lo, alpha_hi))
-                cand = p0 + alpha * v
-                xg, yg = self.projector.snap(float(cand[0]), float(cand[1]))
+            if params.shape[0] > self.n_drones:
+                idx = self.rng.permutation(params.shape[0])[: self.n_drones]
+                params = params[idx]
+            elif params.shape[0] < self.n_drones:
+                extra = self._heuristic_boundary(self.n_drones - params.shape[0], ctx, control_bias=0.0, **base_boundary_kwargs)
+                params = np.vstack([params, np.asarray(extra, dtype=float)]) if extra else params
 
-                t = tangents[idx]
-                u_tan = self._unit(t) if float(np.linalg.norm(t)) > 1e-9 else np.array([0.0, 1.0], dtype=float)
-                u_long = u_tan
-                if wmag > 1e-9 and wind_long_axis_blend > 0.0:
-                    u_wperp = self._unit(np.array([-w_unit[1], w_unit[0]], dtype=float))
-                    u_mix = (1.0 - wind_long_axis_blend) * u_tan + wind_long_axis_blend * u_wperp
-                    if float(np.linalg.norm(u_mix)) > 1e-9:
-                        u_long = self._unit(u_mix)
+            if effective_enabled:
+                filtered = self._apply_effective_filter(
+                    params,
+                    ctx,
+                    min_final_prob=effective_min_final_prob,
+                    max_initial_prob=effective_max_init_prob,
+                    max_boundary_dist=effective_max_boundary_dist,
+                )
+                params = filtered
+                attempts = 0
+                while params.shape[0] < self.n_drones and attempts < 3:
+                    need = (self.n_drones - params.shape[0]) * 2
+                    extra = self._heuristic_boundary(need, ctx, control_bias=0.0, **base_boundary_kwargs)
+                    if not extra:
+                        break
+                    params = np.vstack([params, np.asarray(extra, dtype=float)])
+                    params = self._apply_effective_filter(
+                        params,
+                        ctx,
+                        min_final_prob=effective_min_final_prob,
+                        max_initial_prob=effective_max_init_prob,
+                        max_boundary_dist=effective_max_boundary_dist,
+                    )
+                    attempts += 1
+                if params.shape[0] < self.n_drones:
+                    extra = self._random_params_on_mask(self.n_drones - params.shape[0])
+                    params = np.vstack([params, extra])
 
-                long_angle = float(np.arctan2(u_long[1], u_long[0]))
-                phi = self._phi_from_long_axis_angle(long_angle)
-                if phi_jitter_rad > 0.0:
-                    phi = self._wrap_angle(phi + float(self.rng.normal(0.0, phi_jitter_rad)))
+            if params.shape[0] > self.n_drones:
+                idx = self.rng.permutation(params.shape[0])[: self.n_drones]
+                params = params[idx]
+            elif params.shape[0] < self.n_drones:
+                extra = self._random_params_on_mask(self.n_drones - params.shape[0])
+                params = np.vstack([params, extra])
 
-                theta[3 * d + 0] = float(xg) / max(nx - 1, 1)
-                theta[3 * d + 1] = float(yg) / max(ny - 1, 1)
-                theta[3 * d + 2] = float(phi) / (2.0 * np.pi)
-
-            thetas[i] = np.clip(theta, 0.0, 1.0)
+            thetas[i] = self._encode_params(params)
 
         return thetas[0] if n == 1 else thetas
 
@@ -566,6 +1056,24 @@ class RetardantDropBayesOpt:
         order = np.lexsort((params[:, 2], params[:, 1], params[:, 0]))
         params = params[order]
         return params
+
+    def _encode_params(self, params: np.ndarray) -> np.ndarray:
+        """
+        Helper to convert snapped (x,y,phi) tuples back into theta space.
+        """
+        if self.shape is None:
+            raise RuntimeError("Call setup_search_grid(...) before encoding parameters.")
+        params = np.asarray(params, dtype=float)
+        if params.ndim != 2 or params.shape[1] != 3:
+            raise ValueError(f"Expected params with shape (D,3); got {params.shape}")
+
+        nx, ny = self.shape
+        theta = np.empty(self.dim, dtype=float)
+        for d, (xg, yg, phi) in enumerate(params):
+            theta[3 * d + 0] = float(xg) / max(nx - 1, 1)
+            theta[3 * d + 1] = float(yg) / max(ny - 1, 1)
+            theta[3 * d + 2] = self._wrap_angle(float(phi)) / (2.0 * np.pi)
+        return np.clip(theta, 0.0, 1.0)
 
     def theta_to_gp_features(self, theta: np.ndarray) -> np.ndarray:
         if self.shape is None:
