@@ -485,7 +485,7 @@ class RetardantDropBayesOpt:
         alpha_range: tuple[float, float],
         wind_bias: float,
         value_bias: float,
-        control_bias: float,
+        control_bias: float = 0.0,
         min_arc_sep_frac: float,
         wind_long_axis_blend: float,
         phi_jitter_rad: float,
@@ -878,14 +878,15 @@ class RetardantDropBayesOpt:
                 if cnt <= 0:
                     continue
                 if mode == "boundary":
-                    placements.extend(self._heuristic_boundary(cnt, ctx, control_bias=0.0, **base_boundary_kwargs))
+                    kwargs = dict(base_boundary_kwargs)
+                    placements.extend(self._heuristic_boundary(cnt, ctx, control_bias=0.0, **kwargs))
                 elif mode == "control_tie_in":
                     placements.extend(
                         self._heuristic_boundary(
                             cnt,
                             ctx,
                             control_bias=control_bias,
-                            **base_boundary_kwargs,
+                            **dict(base_boundary_kwargs),
                         )
                     )
                 elif mode == "contingency":
@@ -893,9 +894,8 @@ class RetardantDropBayesOpt:
                         self._heuristic_boundary(
                             cnt,
                             ctx,
-                            alpha_range=contingency_alpha_range,
                             control_bias=control_bias,
-                            **base_boundary_kwargs,
+                            **dict(base_boundary_kwargs, alpha_range=contingency_alpha_range),
                         )
                     )
                 elif mode == "point_protection":
@@ -910,6 +910,8 @@ class RetardantDropBayesOpt:
                         )
                     )
                 elif mode == "head_flank":
+                    head_kwargs = dict(base_boundary_kwargs)
+                    alpha_h = head_kwargs.pop("alpha_range", alpha_range)
                     placements.extend(
                         self._heuristic_head_flank(
                             cnt,
@@ -917,8 +919,8 @@ class RetardantDropBayesOpt:
                             head_frac=head_frac,
                             flank_frac=flank_frac,
                             back_frac=back_frac,
-                            alpha_range=alpha_range,
-                            **base_boundary_kwargs,
+                            alpha_range=alpha_h,
+                            **head_kwargs,
                         )
                     )
                 elif mode == "confine":
@@ -931,10 +933,12 @@ class RetardantDropBayesOpt:
                     )
                 else:
                     # Unknown mode fallback: boundary drop.
-                    placements.extend(self._heuristic_boundary(cnt, ctx, control_bias=0.0, **base_boundary_kwargs))
+                    placements.extend(self._heuristic_boundary(cnt, ctx, control_bias=0.0, **dict(base_boundary_kwargs)))
 
             if len(placements) < self.n_drones:
-                fallback = self._heuristic_boundary(self.n_drones - len(placements), ctx, control_bias=0.0, **base_boundary_kwargs)
+                fallback = self._heuristic_boundary(
+                    self.n_drones - len(placements), ctx, control_bias=0.0, **dict(base_boundary_kwargs)
+                )
                 placements.extend(fallback)
 
             if not placements:
@@ -946,7 +950,9 @@ class RetardantDropBayesOpt:
                 idx = self.rng.permutation(params.shape[0])[: self.n_drones]
                 params = params[idx]
             elif params.shape[0] < self.n_drones:
-                extra = self._heuristic_boundary(self.n_drones - params.shape[0], ctx, control_bias=0.0, **base_boundary_kwargs)
+                extra = self._heuristic_boundary(
+                    self.n_drones - params.shape[0], ctx, control_bias=0.0, **dict(base_boundary_kwargs)
+                )
                 params = np.vstack([params, np.asarray(extra, dtype=float)]) if extra else params
 
             if effective_enabled:
@@ -961,7 +967,7 @@ class RetardantDropBayesOpt:
                 attempts = 0
                 while params.shape[0] < self.n_drones and attempts < 3:
                     need = (self.n_drones - params.shape[0]) * 2
-                    extra = self._heuristic_boundary(need, ctx, control_bias=0.0, **base_boundary_kwargs)
+                    extra = self._heuristic_boundary(need, ctx, control_bias=0.0, **dict(base_boundary_kwargs))
                     if not extra:
                         break
                     params = np.vstack([params, np.asarray(extra, dtype=float)])
