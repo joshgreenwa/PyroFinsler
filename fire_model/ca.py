@@ -32,6 +32,8 @@ class FireEnv:
     diag: bool = True
     avoid_burning_drop: bool = True  # whether to avoid dropping retardant on burning cells
     avoid_drop_p_threshold: float = 0.25  # threshold for considering a cell as burning when avoid_burning_drop is True
+    ros_future_jitter_frac: float = 0.0  # fractional stddev for ROS uncertainty after drop (MC-specific)
+    wind_coeff_future_jitter_frac: float = 0.0  # fractional stddev for wind-coeff uncertainty after drop
     control_suitability: np.ndarray | None = None  # optional (nx, ny) suitability map for POD/control heuristics
 
 
@@ -93,8 +95,8 @@ class CAFireModel:
         self,
         state: FireState,
         *,
-        ros_mps: float = 0.5,
-        wind_coeff: float = 0.5,
+        ros_mps: float | np.ndarray = 0.5,
+        wind_coeff: float | np.ndarray = 0.5,
         diag: bool = True,
     ):
         env = self.env
@@ -126,7 +128,14 @@ class CAFireModel:
         wx = w[..., 0][None, :, :]
         wy = w[..., 1][None, :, :]
         fuel_mul = env.fuel[None, :, :]
-        lambda0 = ros_mps / dx_m
+        ros_arr = np.asarray(ros_mps, dtype=float)
+        n_sims = state.burning.shape[0]
+        if ros_arr.ndim == 0:
+            lambda0 = float(ros_arr) / dx_m
+        else:
+            if ros_arr.shape[0] != n_sims:
+                raise ValueError("ros_mps array must have length equal to n_sims.")
+            lambda0 = ros_arr.reshape(n_sims, 1, 1) / dx_m
 
         if diag:
             dirs = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
@@ -137,6 +146,7 @@ class CAFireModel:
         k = float(env.retardant_k)
         retardant_attn = np.exp(-k * np.maximum(state.retardant, 0.0))
 
+        wind_arr = np.asarray(wind_coeff, dtype=float)
         for sx, sy in dirs:
             src = self._shift_no_wrap(burning, sx, sy)
             if not np.any(src):
@@ -146,7 +156,12 @@ class CAFireModel:
             ux, uy = sx / dist, sy / dist
 
             align = wx * ux + wy * uy
-            bias = 1.0 + wind_coeff * np.maximum(0.0, align)
+            if wind_arr.ndim == 0:
+                bias = 1.0 + float(wind_arr) * np.maximum(0.0, align)
+            else:
+                if wind_arr.shape[0] != n_sims:
+                    raise ValueError("wind_coeff array must have length equal to n_sims.")
+                bias = 1.0 + wind_arr.reshape(n_sims, 1, 1) * np.maximum(0.0, align)
 
             lambda_dir = (lambda0 / dist) * fuel_mul * bias
             lambda_dir = lambda_dir * retardant_attn
@@ -357,12 +372,47 @@ class CAFireModel:
             cell_cap=self.env.retardant_cell_cap,
         )
 
+        if getattr(self, "base_seed", None) is None:
+            rng = np.random.default_rng()
+        else:
+            rng = np.random.default_rng(self.base_seed)
+
+        ros_samples, wind_coeff_samples = self._sample_future_spread_params(
+            n_sims,
+            base_ros_mps=ros_mps,
+            base_wind_coeff=wind_coeff,
+            rng=rng,
+        )
+
         num_steps = int(T / self.env.dt_s)
         for _ in range(num_steps):
-            self.step_batch(state, ros_mps=ros_mps, wind_coeff=wind_coeff, diag=diag)
+            self.step_batch(state, ros_mps=ros_samples, wind_coeff=wind_coeff_samples, diag=diag)
 
         updated_firestate = self.aggregate_mc_to_state(state)
         return updated_firestate
+
+    def _sample_future_spread_params(
+        self,
+        n_sims: int,
+        *,
+        base_ros_mps: float,
+        base_wind_coeff: float,
+        rng: np.random.Generator,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        ros = np.full(int(n_sims), float(base_ros_mps), dtype=float)
+        wind_coeff = np.full(int(n_sims), float(base_wind_coeff), dtype=float)
+
+        frac_ros = max(float(self.env.ros_future_jitter_frac), 0.0)
+        if frac_ros > 0.0:
+            noise = rng.normal(0.0, frac_ros, size=n_sims)
+            ros = np.clip(ros * (1.0 + noise), 1e-6, None)
+
+        frac_wind = max(float(self.env.wind_coeff_future_jitter_frac), 0.0)
+        if frac_wind > 0.0:
+            noise = rng.normal(0.0, frac_wind, size=n_sims)
+            wind_coeff = np.clip(wind_coeff * (1.0 + noise), 0.0, None)
+
+        return ros, wind_coeff
 
     def simulate_from_firestate(
         self,
@@ -453,8 +503,15 @@ class CAFireModel:
             cell_cap=self.env.retardant_cell_cap,
         )
 
+        ros_samples, wind_coeff_samples = self._sample_future_spread_params(
+            n_sims,
+            base_ros_mps=ros_mps,
+            base_wind_coeff=wind_coeff,
+            rng=rng,
+        )
+
         for _ in range(num_steps):
-            self.step_batch(state, ros_mps=ros_mps, wind_coeff=wind_coeff, diag=diag)
+            self.step_batch(state, ros_mps=ros_samples, wind_coeff=wind_coeff_samples, diag=diag)
 
         return self.aggregate_mc_to_state(state)
 
