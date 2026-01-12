@@ -164,6 +164,25 @@ class CAFireModel:
                 bias = 1.0 + wind_arr.reshape(n_sims, 1, 1) * np.maximum(0.0, align)
 
             lambda_dir = (lambda0 / dist) * fuel_mul * bias
+            if env.slope is not None:
+                slope_grad = np.asarray(env.slope, dtype=float)
+                if slope_grad.shape != (n_sims, nx, ny, 2) and slope_grad.shape != env.slope.shape:
+                    slope = np.asarray(env.slope, dtype=float)
+                else:
+                    slope = slope_grad
+                if slope.ndim == 3:  # same for all sims
+                    slope_x = slope[..., 0]
+                    slope_y = slope[..., 1]
+                else:
+                    slope_x = slope[..., 0]
+                    slope_y = slope[..., 1]
+                grade_along = slope_x * ux + slope_y * uy
+                theta = np.arctan(grade_along) * 180.0 / np.pi
+                theta = np.clip(theta, -30.0, 30.0)
+                slope_factor = np.power(2.0, theta / 10.0)
+                bias *= slope_factor
+
+            lambda_dir = (lambda0 / dist) * fuel_mul * bias
             lambda_dir = lambda_dir * retardant_attn
 
             p_dir = 1.0 - np.exp(-lambda_dir * dt_s)
