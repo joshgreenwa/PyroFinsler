@@ -316,17 +316,20 @@ class CAFireModel:
         cell_cap: float | None = None,  # optional cap on accumulated retardant per cell
     ):
         if drone_params is None:
+            print("No drone_params")
             return
         drone_params = np.asarray(drone_params, dtype=float)
         if drone_params.size == 0:
-            return
+            print("Empty drone_params")
         if drone_params.ndim != 2 or drone_params.shape[1] != 3:
             raise ValueError(f"drone_params must have shape (D,3); got {drone_params.shape}")
 
         n_sims, nx, ny = state.retardant.shape
-        half_w = 0.5 * (drop_w_km / self.dx)
-        half_h = 0.5 * (drop_h_km / self.dx)
+        
+        half_w = max(0.5, 0.5 * (drop_w_km / self.dx))
+        half_h = max(0.5, 0.5 * (drop_h_km / self.dx))
 
+        print(f"Applying retardant drop: D={drone_params}, amount={amount}, drop_w_km={drop_w_km}, drop_h_km={drop_h_km}")
         X = np.arange(nx)[:, None]
         Y = np.arange(ny)[None, :]
 

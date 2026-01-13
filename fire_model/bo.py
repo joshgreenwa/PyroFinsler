@@ -576,6 +576,8 @@ class RetardantDropBayesOpt:
         exclusion_cells: float,
         asset_wind_blend: float,
         min_value_quantile: float,
+        pos_jitter_cells: float = 0.0,
+        phi_jitter_rad: float = 0.0,
     ) -> list[list[float]]:
         if count <= 0:
             return []
@@ -593,6 +595,8 @@ class RetardantDropBayesOpt:
         wind_unit = ctx["wind_unit"]
         asset_wind_blend = float(np.clip(asset_wind_blend, 0.0, 1.0))
         offset_cells = float(max(offset_cells, 0.0))
+        pos_jitter_cells = float(max(pos_jitter_cells, 0.0))
+        phi_jitter_rad = float(max(phi_jitter_rad, 0.0))
 
         for idx in order:
             if len(placements) >= count:
@@ -610,9 +614,13 @@ class RetardantDropBayesOpt:
             if float(np.linalg.norm(approach)) <= 1e-9:
                 approach = np.array([0.0, 1.0], dtype=float)
             target = pos - approach * offset_cells
+            if pos_jitter_cells > 0.0:
+                target = target + self.rng.normal(0.0, pos_jitter_cells, size=2)
             xg, yg = self.projector.snap(float(target[0]), float(target[1]))
             long_axis = np.array([-approach[1], approach[0]], dtype=float)
             phi = self._phi_from_long_axis_angle(float(np.arctan2(long_axis[1], long_axis[0])))
+            if phi_jitter_rad > 0.0:
+                phi = self._wrap_angle(phi + float(self.rng.normal(0.0, phi_jitter_rad)))
             placements.append([xg, yg, phi])
             centers.append(pos)
 
@@ -676,6 +684,8 @@ class RetardantDropBayesOpt:
         ctx: dict,
         *,
         offset_cells: float,
+        pos_jitter_cells: float = 0.0,
+        phi_jitter_rad: float = 0.0,
     ) -> list[list[float]]:
         if count <= 0:
             return []
@@ -693,12 +703,18 @@ class RetardantDropBayesOpt:
         t_vals = np.linspace(-1.0, 1.0, num=max(count, 1))
         placements: list[list[float]] = []
         offset_cells = float(offset_cells)
+        pos_jitter_cells = float(max(pos_jitter_cells, 0.0))
+        phi_jitter_rad = float(max(phi_jitter_rad, 0.0))
         for i, t in enumerate(t_vals[:count]):
             base = center + long_vec * (t * scale)
             direction = short_vec * ((-1) ** i) * offset_cells
             pt = base + direction
+            if pos_jitter_cells > 0.0:
+                pt = pt + self.rng.normal(0.0, pos_jitter_cells, size=2)
             xg, yg = self.projector.snap(float(pt[0]), float(pt[1]))
             phi = self._phi_from_long_axis_angle(float(np.arctan2(short_vec[1], short_vec[0])))
+            if phi_jitter_rad > 0.0:
+                phi = self._wrap_angle(phi + float(self.rng.normal(0.0, phi_jitter_rad)))
             placements.append([xg, yg, phi])
         return placements
 
@@ -812,10 +828,12 @@ class RetardantDropBayesOpt:
         point_exclusion_cells: float = 6.0,
         point_asset_wind_blend: float = 0.5,
         point_value_quantile: float = 0.85,
+        point_jitter_cells: float = 0.5,
         head_frac: float = 0.4,
         flank_frac: float = 0.4,
         back_frac: float = 0.2,
         confine_offset_cells: float = 3.0,
+        confine_jitter_cells: float = 0.5,
         effective_min_final_prob: float = 0.2,
         effective_max_init_prob: float = 0.7,
         effective_max_boundary_dist: float | None = 6.0,
@@ -907,6 +925,8 @@ class RetardantDropBayesOpt:
                             exclusion_cells=point_exclusion_cells,
                             asset_wind_blend=point_asset_wind_blend,
                             min_value_quantile=point_value_quantile,
+                            pos_jitter_cells=point_jitter_cells,
+                            phi_jitter_rad=phi_jitter_rad,
                         )
                     )
                 elif mode == "head_flank":
@@ -929,6 +949,8 @@ class RetardantDropBayesOpt:
                             cnt,
                             ctx,
                             offset_cells=confine_offset_cells,
+                            pos_jitter_cells=confine_jitter_cells,
+                            phi_jitter_rad=phi_jitter_rad,
                         )
                     )
                 else:
@@ -1097,6 +1119,7 @@ class RetardantDropBayesOpt:
 
     def expected_value_burned_area(self, theta: np.ndarray) -> float:
         drone_params = self.decode_theta(theta)
+        print("drone_params:", drone_params)
         evolved_firestate = self.fire_model.simulate_from_firestate(
             self.init_firestate,
             T=self.evolution_time_s,
