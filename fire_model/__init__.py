@@ -16,15 +16,11 @@ from fire_model.harmonic import (
     plot_boundary_correspondence,
 )
 from fire_model.bo import RetardantDropBayesOpt, SearchGridProjector, TiedXYFiMatern, expected_improvement
-from fire_model.finsler import FinslerFireModel, anisotropic_arrival_times, FinslerResult
 
 __all__ = [
     "CAFireModel",
     "FireEnv",
     "FireState",
-    "FinslerFireModel",
-    "FinslerResult",
-    "anisotropic_arrival_times",
     "FireBoundary",
     "between_boundaries_mask",
     "candidates_from_mask",

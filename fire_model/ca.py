@@ -102,6 +102,7 @@ class CAFireModel:
         env = self.env
         dt_s = float(env.dt_s)
         dx_m = float(self.dx_m)
+        nx, ny = env.grid_size
 
         burning = state.burning
         burned = state.burned
@@ -124,7 +125,11 @@ class CAFireModel:
             return
 
         unburned = ~(burning | burned)
-        w = env.wind[state.t] if env.wind.ndim == 4 else env.wind
+        if env.wind.ndim == 4:
+            wt = int(np.clip(int(state.t), 0, env.wind.shape[0] - 1))
+            w = env.wind[wt]
+        else:
+            w = env.wind
         wx = w[..., 0][None, :, :]
         wy = w[..., 1][None, :, :]
         fuel_mul = env.fuel[None, :, :]
