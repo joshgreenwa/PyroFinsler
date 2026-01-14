@@ -536,6 +536,7 @@ class RetardantDropBayesOpt:
         *,
         offset_cells: float,
         phi_jitter_rad: float,
+        orientation: str = "perp",
     ) -> list[float] | None:
         if ctx["wind_mag"] <= 1e-9:
             return None
@@ -543,8 +544,14 @@ class RetardantDropBayesOpt:
         wind_unit = ctx["wind_unit"]
         pt = inner_xy[idx] + wind_unit * float(offset_cells)
         xg, yg = self.projector.snap(float(pt[0]), float(pt[1]))
-        u_perp = self._unit(np.array([-wind_unit[1], wind_unit[0]], dtype=float))
-        long_angle = float(np.arctan2(u_perp[1], u_perp[0]))
+        orient = str(orientation).lower().strip()
+        if orient in ("perp", "perpendicular", "cross", "crosswind"):
+            u_long = self._unit(np.array([-wind_unit[1], wind_unit[0]], dtype=float))
+        elif orient in ("parallel", "wind", "downwind"):
+            u_long = wind_unit
+        else:
+            u_long = self._unit(np.array([-wind_unit[1], wind_unit[0]], dtype=float))
+        long_angle = float(np.arctan2(u_long[1], u_long[0]))
         phi = self._phi_from_long_axis_angle(long_angle)
         if phi_jitter_rad > 0.0:
             phi = self._wrap_angle(phi + float(self.rng.normal(0.0, phi_jitter_rad)))
@@ -557,13 +564,23 @@ class RetardantDropBayesOpt:
         *,
         offset_cells: float,
         phi_jitter_rad: float,
+        orientation: str = "normal",
     ) -> list[float]:
         inner_xy = ctx["inner_xy"]
         v_unit = ctx["v_unit"]
         tangents = ctx["tangents"]
         pt = inner_xy[idx] + v_unit[idx] * float(offset_cells)
         xg, yg = self.projector.snap(float(pt[0]), float(pt[1]))
-        long_angle = float(np.arctan2(tangents[idx][1], tangents[idx][0]))
+        orient = str(orientation).lower().strip()
+        if orient in ("normal", "perp", "perpendicular"):
+            u_long = v_unit[idx]
+            if float(np.linalg.norm(u_long)) <= 1e-9:
+                u_long = ctx["normals"][idx]
+        elif orient in ("tangent", "parallel"):
+            u_long = tangents[idx]
+        else:
+            u_long = tangents[idx]
+        long_angle = float(np.arctan2(u_long[1], u_long[0]))
         phi = self._phi_from_long_axis_angle(long_angle)
         if phi_jitter_rad > 0.0:
             phi = self._wrap_angle(phi + float(self.rng.normal(0.0, phi_jitter_rad)))
@@ -686,6 +703,10 @@ class RetardantDropBayesOpt:
         offset_cells: float,
         head_align_threshold: float,
         phi_jitter_rad: float,
+        min_arc_sep_frac: float,
+        orientation: str,
+        layer_spacing_cells: float,
+        max_layers: int,
     ) -> list[list[float]]:
         if count <= 0 or ctx["wind_mag"] <= 1e-9:
             return []
@@ -695,17 +716,54 @@ class RetardantDropBayesOpt:
         head_idx = np.where(align >= float(head_align_threshold))[0]
         if head_idx.size == 0:
             return []
-        chosen = self._select_evenly_spaced(count, head_idx)
+        K = v_unit.shape[0]
+        min_arc = self._min_arc_for_count(K, count, min_arc_sep_frac)
+        scores = np.zeros(K, dtype=float)
+        scores[head_idx] = 1.0
+        chosen = self._select_spaced_by_score(count, scores, min_arc=min_arc, idx_pool=head_idx)
+        if not chosen:
+            return []
+        chosen = np.asarray(chosen, dtype=int)
+        layer_spacing_cells = float(max(layer_spacing_cells, 0.0))
+        max_layers = int(max(max_layers, 1))
         placements: list[list[float]] = []
-        for idx in chosen:
-            downwind = self._placement_downwind(
-                int(idx),
-                ctx,
-                offset_cells=offset_cells,
-                phi_jitter_rad=phi_jitter_rad,
-            )
-            if downwind is not None:
-                placements.append(downwind)
+        if count <= len(chosen):
+            chosen = chosen[:count]
+            for idx in chosen:
+                downwind = self._placement_downwind(
+                    int(idx),
+                    ctx,
+                    offset_cells=offset_cells,
+                    phi_jitter_rad=phi_jitter_rad,
+                    orientation=orientation,
+                )
+                if downwind is not None:
+                    placements.append(downwind)
+            return placements
+
+        layers = int(np.ceil(float(count) / max(len(chosen), 1)))
+        layers = min(layers, max_layers)
+        base = chosen.tolist()
+        for layer in range(layers):
+            needed = count - len(placements)
+            if needed <= 0:
+                break
+            offset = float(offset_cells) + float(layer) * layer_spacing_cells
+            if layer > 0 and len(base) > 1:
+                shift = int(self.rng.integers(0, len(base)))
+                layer_idx = base[shift:] + base[:shift]
+            else:
+                layer_idx = base
+            for idx in layer_idx[:needed]:
+                downwind = self._placement_downwind(
+                    int(idx),
+                    ctx,
+                    offset_cells=offset,
+                    phi_jitter_rad=phi_jitter_rad,
+                    orientation=orientation,
+                )
+                if downwind is not None:
+                    placements.append(downwind)
         return placements
 
     def _heuristic_tangent_blocking(
@@ -717,6 +775,7 @@ class RetardantDropBayesOpt:
         wind_offset_scale: float,
         shoulder_align_range: tuple[float, float],
         phi_jitter_rad: float,
+        orientation: str,
     ) -> list[list[float]]:
         if count <= 0:
             return []
@@ -744,6 +803,7 @@ class RetardantDropBayesOpt:
                     ctx,
                     offset_cells=offset,
                     phi_jitter_rad=phi_jitter_rad,
+                    orientation=orientation,
                 )
             )
         return placements
@@ -1101,9 +1161,14 @@ class RetardantDropBayesOpt:
         asset_burning_threshold: float = 0.3,
         downwind_offset_cells: float = 6.0,
         downwind_head_align: float = 0.4,
+        downwind_orientation: str = "perp",
+        downwind_min_arc_sep_frac: float | None = None,
+        downwind_layer_spacing_cells: float = 3.0,
+        downwind_max_layers: int = 3,
         tangent_offset_cells: float = 3.0,
         tangent_wind_scale: float = 2.0,
         tangent_shoulder_align: tuple[float, float] = (0.1, 0.6),
+        tangent_orientation: str = "normal",
         contingency_alpha_range: tuple[float, float] = (0.65, 0.95),
         point_offset_cells: float = 4.0,
         point_exclusion_cells: float = 6.0,
@@ -1250,6 +1315,7 @@ class RetardantDropBayesOpt:
                         )
                     )
                 elif mode == "downwind_blocking":
+                    dw_min_arc = min_arc_sep_frac if downwind_min_arc_sep_frac is None else downwind_min_arc_sep_frac
                     placements.extend(
                         self._heuristic_downwind_blocking(
                             cnt,
@@ -1257,6 +1323,10 @@ class RetardantDropBayesOpt:
                             offset_cells=downwind_offset_cells,
                             head_align_threshold=downwind_head_align,
                             phi_jitter_rad=phi_jitter_rad,
+                            min_arc_sep_frac=dw_min_arc,
+                            orientation=downwind_orientation,
+                            layer_spacing_cells=downwind_layer_spacing_cells,
+                            max_layers=downwind_max_layers,
                         )
                     )
                 elif mode == "tangent_blocking":
@@ -1268,6 +1338,7 @@ class RetardantDropBayesOpt:
                             wind_offset_scale=tangent_wind_scale,
                             shoulder_align_range=tangent_shoulder_align,
                             phi_jitter_rad=phi_jitter_rad,
+                            orientation=tangent_orientation,
                         )
                     )
                 else:
