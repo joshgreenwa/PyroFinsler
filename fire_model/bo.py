@@ -365,6 +365,8 @@ class RetardantDropBayesOpt:
         control_map: np.ndarray | None = None,
         score_alpha: float = 0.6,
     ) -> dict:
+        # Build context with precomputed quantities for heuristic sampling.
+        # Used internally by various heuristic methods.
         if any(x is None for x in (self.projector, self.shape, self.init_boundary, self.final_boundary)):
             raise RuntimeError("Search grid not initialised; call setup_search_grid(...) first.")
 
@@ -477,6 +479,275 @@ class RetardantDropBayesOpt:
             i += 1
         return counts
 
+    def _min_arc_for_count(self, K: int, count: int, min_arc_sep_frac: float) -> int:
+        K = int(max(K, 1))
+        count = int(max(count, 1))
+        per = float(K) / float(count)
+        min_arc = int(np.floor(float(min_arc_sep_frac) * per))
+        return int(np.clip(min_arc, 1, max(K // 2, 1)))
+
+    def _select_spaced_by_score(
+        self,
+        count: int,
+        scores: np.ndarray,
+        *,
+        min_arc: int,
+        idx_pool: np.ndarray | None = None,
+    ) -> list[int]:
+        if count <= 0:
+            return []
+        scores = np.asarray(scores, dtype=float)
+        K = scores.shape[0]
+        idx_pool = np.arange(K, dtype=int) if idx_pool is None else np.asarray(idx_pool, dtype=int)
+        if idx_pool.size == 0:
+            return []
+        order = idx_pool[np.argsort(scores[idx_pool])[::-1]]
+        taken = np.zeros(K, dtype=bool)
+        chosen: list[int] = []
+        for idx in order:
+            if len(chosen) >= count:
+                break
+            if taken[idx]:
+                continue
+            chosen.append(int(idx))
+            for off in range(-min_arc, min_arc + 1):
+                taken[(idx + off) % K] = True
+        return chosen
+
+    def _select_evenly_spaced(self, count: int, idx_pool: np.ndarray) -> list[int]:
+        count = int(max(count, 0))
+        if count <= 0:
+            return []
+        pool = np.asarray(idx_pool, dtype=int)
+        if pool.size == 0:
+            return []
+        pool = np.sort(pool)
+        if count >= pool.size:
+            return pool.tolist()
+        offset = int(self.rng.integers(0, pool.size))
+        base = np.linspace(0, pool.size - 1, num=count, dtype=int)
+        sel = (base + offset) % pool.size
+        return pool[sel].tolist()
+
+    def _placement_downwind(
+        self,
+        idx: int,
+        ctx: dict,
+        *,
+        offset_cells: float,
+        phi_jitter_rad: float,
+    ) -> list[float] | None:
+        if ctx["wind_mag"] <= 1e-9:
+            return None
+        inner_xy = ctx["inner_xy"]
+        wind_unit = ctx["wind_unit"]
+        pt = inner_xy[idx] + wind_unit * float(offset_cells)
+        xg, yg = self.projector.snap(float(pt[0]), float(pt[1]))
+        u_perp = self._unit(np.array([-wind_unit[1], wind_unit[0]], dtype=float))
+        long_angle = float(np.arctan2(u_perp[1], u_perp[0]))
+        phi = self._phi_from_long_axis_angle(long_angle)
+        if phi_jitter_rad > 0.0:
+            phi = self._wrap_angle(phi + float(self.rng.normal(0.0, phi_jitter_rad)))
+        return [xg, yg, phi]
+
+    def _placement_tangent(
+        self,
+        idx: int,
+        ctx: dict,
+        *,
+        offset_cells: float,
+        phi_jitter_rad: float,
+    ) -> list[float]:
+        inner_xy = ctx["inner_xy"]
+        v_unit = ctx["v_unit"]
+        tangents = ctx["tangents"]
+        pt = inner_xy[idx] + v_unit[idx] * float(offset_cells)
+        xg, yg = self.projector.snap(float(pt[0]), float(pt[1]))
+        long_angle = float(np.arctan2(tangents[idx][1], tangents[idx][0]))
+        phi = self._phi_from_long_axis_angle(long_angle)
+        if phi_jitter_rad > 0.0:
+            phi = self._wrap_angle(phi + float(self.rng.normal(0.0, phi_jitter_rad)))
+        return [xg, yg, phi]
+
+    def _heuristic_fire_asset_blocking(
+        self,
+        count: int,
+        ctx: dict,
+        *,
+        asset_value_quantile: float,
+        asset_alpha_range: tuple[float, float],
+        asset_distance_scale_cells: float | None,
+        asset_burning_threshold: float,
+        min_arc_sep_frac: float,
+        downwind_offset_cells: float,
+        tangent_offset_cells: float,
+        tangent_wind_scale: float,
+        phi_jitter_rad: float,
+    ) -> list[list[float]]:
+        if count <= 0:
+            return []
+        value_map = ctx["value_map"]
+        flat = value_map.ravel()
+        if float(np.max(flat)) <= 0.0:
+            return []
+        quantile = float(np.clip(asset_value_quantile, 0.0, 1.0))
+        thresh = np.quantile(flat, quantile) if quantile > 0.0 else np.min(flat)
+        asset_mask = value_map >= thresh
+        if not np.any(asset_mask):
+            return []
+        asset_coords = np.column_stack(np.where(asset_mask)).astype(float)
+        asset_vals = value_map[asset_mask].astype(float)
+        vmin = float(np.min(asset_vals))
+        vmax = float(np.max(asset_vals))
+        if vmax <= vmin + 1e-9:
+            asset_scores = np.ones_like(asset_vals, dtype=float)
+        else:
+            asset_scores = (asset_vals - vmin) / (vmax - vmin)
+
+        tree = cKDTree(asset_coords)
+        inner_xy = ctx["inner_xy"]
+        dists, nearest = tree.query(inner_xy)
+        scale = asset_distance_scale_cells
+        if scale is None:
+            scale = max(float(np.median(dists)), 1.0)
+        score = np.exp(-dists / float(max(scale, 1e-6))) * (0.5 + 0.5 * asset_scores[nearest])
+
+        K = inner_xy.shape[0]
+        min_arc = self._min_arc_for_count(K, count, min_arc_sep_frac)
+        chosen = self._select_spaced_by_score(count, score, min_arc=min_arc)
+        if not chosen:
+            return []
+
+        lo, hi = asset_alpha_range
+        lo = float(np.clip(lo, 0.0, 1.0))
+        hi = float(np.clip(hi, 0.0, 1.0))
+        if hi < lo:
+            lo, hi = hi, lo
+
+        p_init = ctx["p_init"]
+        placements: list[list[float]] = []
+        for idx in chosen:
+            asset_pos = asset_coords[int(nearest[idx])]
+            ax = int(np.clip(round(asset_pos[0]), 0, self.shape[0] - 1))
+            ay = int(np.clip(round(asset_pos[1]), 0, self.shape[1] - 1))
+            asset_burning = p_init[ax, ay] >= float(asset_burning_threshold)
+            if asset_burning:
+                downwind = self._placement_downwind(
+                    idx,
+                    ctx,
+                    offset_cells=downwind_offset_cells,
+                    phi_jitter_rad=phi_jitter_rad,
+                )
+                if downwind is not None:
+                    placements.append(downwind)
+                else:
+                    offset = float(tangent_offset_cells) + float(tangent_wind_scale) * float(ctx["wind_mag"])
+                    placements.append(
+                        self._placement_tangent(
+                            idx,
+                            ctx,
+                            offset_cells=offset,
+                            phi_jitter_rad=phi_jitter_rad,
+                        )
+                    )
+                continue
+
+            vec = asset_pos - inner_xy[idx]
+            if float(np.linalg.norm(vec)) <= 1e-9:
+                offset = float(tangent_offset_cells) + float(tangent_wind_scale) * float(ctx["wind_mag"])
+                placements.append(
+                    self._placement_tangent(
+                        idx,
+                        ctx,
+                        offset_cells=offset,
+                        phi_jitter_rad=phi_jitter_rad,
+                    )
+                )
+                continue
+
+            alpha = float(self.rng.uniform(lo, hi))
+            pt = inner_xy[idx] + alpha * vec
+            xg, yg = self.projector.snap(float(pt[0]), float(pt[1]))
+            u = self._unit(vec)
+            u_perp = self._unit(np.array([-u[1], u[0]], dtype=float))
+            long_angle = float(np.arctan2(u_perp[1], u_perp[0]))
+            phi = self._phi_from_long_axis_angle(long_angle)
+            if phi_jitter_rad > 0.0:
+                phi = self._wrap_angle(phi + float(self.rng.normal(0.0, phi_jitter_rad)))
+            placements.append([xg, yg, phi])
+
+        return placements
+
+    def _heuristic_downwind_blocking(
+        self,
+        count: int,
+        ctx: dict,
+        *,
+        offset_cells: float,
+        head_align_threshold: float,
+        phi_jitter_rad: float,
+    ) -> list[list[float]]:
+        if count <= 0 or ctx["wind_mag"] <= 1e-9:
+            return []
+        v_unit = ctx["v_unit"]
+        wind_unit = ctx["wind_unit"]
+        align = v_unit @ wind_unit
+        head_idx = np.where(align >= float(head_align_threshold))[0]
+        if head_idx.size == 0:
+            return []
+        chosen = self._select_evenly_spaced(count, head_idx)
+        placements: list[list[float]] = []
+        for idx in chosen:
+            downwind = self._placement_downwind(
+                int(idx),
+                ctx,
+                offset_cells=offset_cells,
+                phi_jitter_rad=phi_jitter_rad,
+            )
+            if downwind is not None:
+                placements.append(downwind)
+        return placements
+
+    def _heuristic_tangent_blocking(
+        self,
+        count: int,
+        ctx: dict,
+        *,
+        offset_cells: float,
+        wind_offset_scale: float,
+        shoulder_align_range: tuple[float, float],
+        phi_jitter_rad: float,
+    ) -> list[list[float]]:
+        if count <= 0:
+            return []
+        v_unit = ctx["v_unit"]
+        wind_unit = ctx["wind_unit"]
+        align = v_unit @ wind_unit
+        lo, hi = shoulder_align_range
+        lo = float(np.clip(lo, 0.0, 1.0))
+        hi = float(np.clip(hi, 0.0, 1.0))
+        if hi < lo:
+            lo, hi = hi, lo
+        if ctx["wind_mag"] <= 1e-9:
+            shoulder_idx = np.arange(v_unit.shape[0], dtype=int)
+        else:
+            shoulder_idx = np.where((np.abs(align) >= lo) & (np.abs(align) <= hi))[0]
+        if shoulder_idx.size == 0:
+            return []
+        chosen = self._select_evenly_spaced(count, shoulder_idx)
+        offset = float(offset_cells) + float(wind_offset_scale) * float(ctx["wind_mag"])
+        placements: list[list[float]] = []
+        for idx in chosen:
+            placements.append(
+                self._placement_tangent(
+                    int(idx),
+                    ctx,
+                    offset_cells=offset,
+                    phi_jitter_rad=phi_jitter_rad,
+                )
+            )
+        return placements
+
     def _heuristic_boundary(
         self,
         count: int,
@@ -491,6 +762,7 @@ class RetardantDropBayesOpt:
         phi_jitter_rad: float,
         allowed_idx: np.ndarray | None = None,
     ) -> list[list[float]]:
+        # Boundary-following heuristic sampling. 
         if count <= 0:
             return []
         inner_xy = ctx["inner_xy"]
@@ -807,6 +1079,15 @@ class RetardantDropBayesOpt:
         heuristic_allocations: dict | None = None,
         control_map: np.ndarray | None = None,
         control_bias: float = 2.0,
+        asset_value_quantile: float = 0.90,
+        asset_alpha_range: tuple[float, float] = (0.45, 0.70),
+        asset_distance_scale_cells: float | None = None,
+        asset_burning_threshold: float = 0.3,
+        downwind_offset_cells: float = 6.0,
+        downwind_head_align: float = 0.4,
+        tangent_offset_cells: float = 3.0,
+        tangent_wind_scale: float = 2.0,
+        tangent_shoulder_align: tuple[float, float] = (0.1, 0.6),
         contingency_alpha_range: tuple[float, float] = (0.65, 0.95),
         point_offset_cells: float = 4.0,
         point_exclusion_cells: float = 6.0,
@@ -823,6 +1104,9 @@ class RetardantDropBayesOpt:
     ):
         """
         Rich heuristic initialisation that can combine multiple strategies:
+          - fire-asset blocking between the fire front and high-value cells
+          - downwind blocking ahead of the head fire
+          - tangent/shoulder blocking offset from the fire front
           - boundary-based (wind-aware / value-aware, original behaviour)
           - POD/control-feature tie-in (control map biasing)
           - contingency-line allocation
@@ -835,13 +1119,9 @@ class RetardantDropBayesOpt:
         """
         ctx = self._build_heuristic_context(control_map=control_map, score_alpha=score_alpha)
         default_modes = [
-            "control_tie_in",
-            "point_protection",
-            "contingency",
-            "head_flank",
-            "confine",
-            "boundary",
-            "effective_interaction",
+            "fire_asset_blocking",
+            "downwind_blocking",
+            "tangent_blocking",
         ]
         modes = heuristic_modes if heuristic_modes is not None else default_modes
         modes = [str(m).lower().strip() for m in modes if str(m).strip()]
@@ -929,6 +1209,43 @@ class RetardantDropBayesOpt:
                             cnt,
                             ctx,
                             offset_cells=confine_offset_cells,
+                        )
+                    )
+                elif mode == "fire_asset_blocking":
+                    placements.extend(
+                        self._heuristic_fire_asset_blocking(
+                            cnt,
+                            ctx,
+                            asset_value_quantile=asset_value_quantile,
+                            asset_alpha_range=asset_alpha_range,
+                            asset_distance_scale_cells=asset_distance_scale_cells,
+                            asset_burning_threshold=asset_burning_threshold,
+                            min_arc_sep_frac=min_arc_sep_frac,
+                            downwind_offset_cells=downwind_offset_cells,
+                            tangent_offset_cells=tangent_offset_cells,
+                            tangent_wind_scale=tangent_wind_scale,
+                            phi_jitter_rad=phi_jitter_rad,
+                        )
+                    )
+                elif mode == "downwind_blocking":
+                    placements.extend(
+                        self._heuristic_downwind_blocking(
+                            cnt,
+                            ctx,
+                            offset_cells=downwind_offset_cells,
+                            head_align_threshold=downwind_head_align,
+                            phi_jitter_rad=phi_jitter_rad,
+                        )
+                    )
+                elif mode == "tangent_blocking":
+                    placements.extend(
+                        self._heuristic_tangent_blocking(
+                            cnt,
+                            ctx,
+                            offset_cells=tangent_offset_cells,
+                            wind_offset_scale=tangent_wind_scale,
+                            shoulder_align_range=tangent_shoulder_align,
+                            phi_jitter_rad=phi_jitter_rad,
                         )
                     )
                 else:
