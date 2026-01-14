@@ -63,6 +63,7 @@ class CAFireModel:
         y = np.arange(ny)[None, :]
         cx, cy = center
         mask2d = (x - cx) ** 2 + (y - cy) ** 2 <= radius_cells ** 2
+        mask2d &= (self.env.fuel > 0.0)
 
         burning = np.zeros((n_sims, nx, ny), dtype=bool)
         burning[:, mask2d] = True
@@ -124,7 +125,9 @@ class CAFireModel:
             state.t += 1
             return
 
-        unburned = ~(burning | burned)
+        burnable = (env.fuel[None, :, :] > 0.0)
+        unburned = burnable & ~(burning | burned)
+
         if env.wind.ndim == 4:
             wt = int(np.clip(int(state.t), 0, env.wind.shape[0] - 1))
             w = env.wind[wt]
@@ -316,17 +319,20 @@ class CAFireModel:
         cell_cap: float | None = None,  # optional cap on accumulated retardant per cell
     ):
         if drone_params is None:
+            print("No drone_params")
             return
         drone_params = np.asarray(drone_params, dtype=float)
         if drone_params.size == 0:
-            return
+            print("Empty drone_params")
         if drone_params.ndim != 2 or drone_params.shape[1] != 3:
             raise ValueError(f"drone_params must have shape (D,3); got {drone_params.shape}")
 
         n_sims, nx, ny = state.retardant.shape
-        half_w = 0.5 * (drop_w_km / self.dx)
-        half_h = 0.5 * (drop_h_km / self.dx)
+        
+        half_w = max(0.5, 0.5 * (drop_w_km / self.dx))
+        half_h = max(0.5, 0.5 * (drop_h_km / self.dx))
 
+        print(f"Applying retardant drop: D={drone_params}, amount={amount}, drop_w_km={drop_w_km}, drop_h_km={drop_h_km}")
         X = np.arange(nx)[:, None]
         Y = np.arange(ny)[None, :]
 
