@@ -63,6 +63,7 @@ class CAFireModel:
         y = np.arange(ny)[None, :]
         cx, cy = center
         mask2d = (x - cx) ** 2 + (y - cy) ** 2 <= radius_cells ** 2
+        mask2d &= (self.env.fuel > 0.0)
 
         burning = np.zeros((n_sims, nx, ny), dtype=bool)
         burning[:, mask2d] = True
@@ -124,7 +125,9 @@ class CAFireModel:
             state.t += 1
             return
 
-        unburned = ~(burning | burned)
+        burnable = (env.fuel[None, :, :] > 0.0)
+        unburned = burnable & ~(burning | burned)
+
         if env.wind.ndim == 4:
             wt = int(np.clip(int(state.t), 0, env.wind.shape[0] - 1))
             w = env.wind[wt]
