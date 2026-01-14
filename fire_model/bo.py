@@ -1,6 +1,7 @@
 import numpy as np
 from numpy.random import default_rng
 from scipy.stats import norm
+from matplotlib import pyplot as plt
 from scipy.stats import qmc
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Hyperparameter, Matern, WhiteKernel, Kernel
@@ -175,6 +176,12 @@ class RetardantDropBayesOpt:
         self.init_boundary: FireBoundary | None = None
         self.final_boundary: FireBoundary | None = None
         self.final_search_firestate: FireState | None = None
+        self.sr_grid: np.ndarray | None = None
+        self.sr_r_targets: np.ndarray | None = None
+        self.sr_phi_grid: np.ndarray | None = None
+        self.sr_valid_mask: np.ndarray | None = None
+        self.sr_index_tree: cKDTree | None = None
+        self.sr_valid_indices: np.ndarray | None = None
 
     @staticmethod
     def _unit(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -254,6 +261,160 @@ class RetardantDropBayesOpt:
         self.projector = SearchGridProjector(mask=mask, coords=coords)
         self.shape = mask.shape
         return mask, coords
+
+    @staticmethod
+    def _build_linear_grid(boundary0_xy: np.ndarray, boundary1_xy: np.ndarray, r_targets: np.ndarray) -> np.ndarray:
+        r_targets = np.asarray(r_targets, dtype=float)
+        grid = np.zeros((boundary0_xy.shape[0], r_targets.size, 2), dtype=float)
+        for j, r in enumerate(r_targets):
+            grid[:, j, :] = (1.0 - r) * boundary0_xy + r * boundary1_xy
+        return grid
+
+    @staticmethod
+    def _smooth_grid_laplace(grid: np.ndarray, *, n_iters: int = 300, omega: float = 1.0) -> np.ndarray:
+        g = np.asarray(grid, dtype=float).copy()
+        for _ in range(int(n_iters)):
+            avg = 0.25 * (
+                np.roll(g, 1, axis=0)
+                + np.roll(g, -1, axis=0)
+                + np.roll(g, 1, axis=1)
+                + np.roll(g, -1, axis=1)
+            )
+            g[:, 1:-1, :] = (1.0 - omega) * g[:, 1:-1, :] + omega * avg[:, 1:-1, :]
+        return g
+
+    @staticmethod
+    def _grid_angle_along_s(grid: np.ndarray) -> np.ndarray:
+        d = np.roll(grid, -1, axis=0) - np.roll(grid, 1, axis=0)
+        return np.arctan2(d[..., 1], d[..., 0])
+
+    def setup_search_grid_polar(
+        self,
+        *,
+        K: int = 500,
+        boundary_field: str = "affected",
+        n_r: int = 160,
+        smooth_iters: int = 350,
+        omega: float = 1.0,
+    ):
+        self.setup_search_grid(K=K, boundary_field=boundary_field)
+        if self.init_boundary is None or self.final_boundary is None:
+            raise RuntimeError("Search grid not initialised; boundaries are missing.")
+
+        inner_xy = np.asarray(self.init_boundary.xy, dtype=float)
+        outer_xy = np.asarray(self.final_boundary.xy, dtype=float)
+        if inner_xy.shape != outer_xy.shape:
+            raise ValueError("Boundary point counts do not match; rerun setup_search_grid.")
+
+        r_targets = np.linspace(0.0, 1.0, int(n_r))
+        grid_linear = self._build_linear_grid(inner_xy, outer_xy, r_targets)
+        grid = self._smooth_grid_laplace(grid_linear, n_iters=smooth_iters, omega=omega)
+
+        valid = np.isfinite(grid[..., 0]) & np.isfinite(grid[..., 1])
+        idx = np.column_stack(np.where(valid))
+        if idx.size == 0:
+            raise RuntimeError("Polar grid has no valid points; check boundaries or parameters.")
+
+        self.sr_grid = grid
+        self.sr_r_targets = r_targets
+        self.sr_phi_grid = self._grid_angle_along_s(grid)
+        self.sr_valid_mask = valid
+        self.sr_valid_indices = idx.astype(float)
+        self.sr_index_tree = cKDTree(self.sr_valid_indices)
+        return grid
+
+    def _sr_lookup(self, s: float, r: float) -> tuple[np.ndarray, float]:
+        if self.sr_grid is None or self.sr_phi_grid is None or self.sr_index_tree is None:
+            raise RuntimeError("Polar grid not initialised; call setup_search_grid_polar(...).")
+
+        grid = self.sr_grid
+        K, R = grid.shape[0], grid.shape[1]
+        s = float(np.clip(s, 0.0, 1.0))
+        r = float(np.clip(r, 0.0, 1.0))
+        i_f = s * (K - 1)
+        j_f = r * (R - 1)
+        i = int(np.round(i_f))
+        j = int(np.round(j_f))
+
+        if not self.sr_valid_mask[i, j]:
+            _, idx = self.sr_index_tree.query([i_f, j_f], k=1)
+            i = int(self.sr_valid_indices[idx, 0])
+            j = int(self.sr_valid_indices[idx, 1])
+
+        xy = grid[i, j]
+        phi = float(self.sr_phi_grid[i, j])
+        return xy, phi
+
+    def plot_polar_domain(
+        self,
+        *,
+        n_s_lines: int = 12,
+        n_r_lines: int = 8,
+        show_fields: bool = True,
+    ):
+        if self.sr_grid is None or self.sr_r_targets is None:
+            raise RuntimeError("Polar grid not initialised; call setup_search_grid_polar(...).")
+        if self.search_domain_mask is None:
+            raise RuntimeError("Search mask missing; call setup_search_grid_polar(...).")
+
+        grid = self.sr_grid
+        mask = self.search_domain_mask
+
+        fig, axes = plt.subplots(1, 3 if show_fields else 1, figsize=(14, 4))
+        if not isinstance(axes, np.ndarray):
+            axes = np.array([axes])
+
+        ax0 = axes[0]
+        ax0.imshow(mask.T, origin="lower", aspect="equal", cmap="Greys", alpha=0.35)
+        for j in range(0, grid.shape[1], max(1, grid.shape[1] // n_r_lines)):
+            curve = grid[:, j]
+            ax0.plot(curve[:, 0], curve[:, 1], color="tab:blue", linewidth=1)
+        for i in range(0, grid.shape[0], max(1, grid.shape[0] // n_s_lines)):
+            curve = grid[i]
+            ax0.plot(curve[:, 0], curve[:, 1], color="tab:orange", linewidth=0.7, alpha=0.7)
+        if self.init_boundary is not None:
+            ax0.plot(self.init_boundary.xy[:, 0], self.init_boundary.xy[:, 1], color="tab:red", linewidth=2)
+        if self.final_boundary is not None:
+            ax0.plot(self.final_boundary.xy[:, 0], self.final_boundary.xy[:, 1], color="tab:green", linewidth=2)
+        ax0.set_title("Polar grid (s,r) on mask")
+        ax0.set_xticks([])
+        ax0.set_yticks([])
+
+        if not show_fields:
+            plt.tight_layout()
+            plt.show()
+            return
+
+        valid = np.isfinite(grid[..., 0]) & np.isfinite(grid[..., 1])
+        pts = grid[valid]
+        idxs = np.column_stack(np.where(valid))
+        tree = cKDTree(pts)
+        coords = np.column_stack(np.where(mask)).astype(float)
+        _, nn = tree.query(coords, k=1)
+
+        s_idx = idxs[nn, 0]
+        r_idx = idxs[nn, 1]
+        s_field = np.full(mask.shape, np.nan)
+        r_field = np.full(mask.shape, np.nan)
+        s_field[coords[:, 0].astype(int), coords[:, 1].astype(int)] = s_idx / float(grid.shape[0])
+        r_field[coords[:, 0].astype(int), coords[:, 1].astype(int)] = self.sr_r_targets[r_idx]
+
+        ax1 = axes[1]
+        im1 = ax1.imshow(s_field.T, origin="lower", aspect="equal", cmap="viridis")
+        ax1.set_title("s field")
+        ax1.set_xticks([])
+        ax1.set_yticks([])
+        plt.colorbar(im1, ax=ax1, fraction=0.046)
+
+        ax2 = axes[2]
+        im2 = ax2.imshow(r_field.T, origin="lower", aspect="equal", cmap="viridis")
+        ax2.set_title("r field")
+        ax2.set_xticks([])
+        ax2.set_yticks([])
+        plt.colorbar(im2, ax=ax2, fraction=0.046)
+
+        plt.tight_layout()
+        plt.show()
 
     def sample_random_theta(self, n: int = 1):
         if n == 1:
@@ -808,6 +969,121 @@ class RetardantDropBayesOpt:
             )
         return placements
 
+    def _heuristic_connected_line(
+        self,
+        count: int,
+        ctx: dict,
+        *,
+        offset_cells: float | None,
+        overlap_frac: float,
+        wind_bias: float,
+        value_bias: float,
+        control_bias: float,
+        phi_jitter_rad: float,
+        orientation: str,
+        centered: bool,
+    ) -> list[list[float]]:
+        if count <= 0:
+            return []
+        inner_xy = ctx["inner_xy"]
+        v_out = ctx["v_out"]
+        v_unit = ctx["v_unit"]
+        tangents = ctx["tangents"]
+        normals = ctx["normals"]
+        K = inner_xy.shape[0]
+        if K == 0:
+            return []
+
+        dx = float(getattr(self.fire_model, "dx", 1.0))
+        env = self.fire_model.env
+        drop_h_cells = float(getattr(env, "drop_h_km", 0.0)) / max(dx, 1e-9)
+        drop_w_cells = float(getattr(env, "drop_w_km", 0.0)) / max(dx, 1e-9)
+        drop_h_cells = max(drop_h_cells, 1.0)
+        drop_w_cells = max(drop_w_cells, 1.0)
+
+        if offset_cells is None:
+            offset_cells = 0.6 * drop_w_cells
+        offset_cells = float(max(offset_cells, 0.0))
+
+        overlap_frac = float(np.clip(overlap_frac, 0.0, 0.9))
+        spacing_cells = max(0.5, drop_h_cells * (1.0 - overlap_frac))
+
+        seg = np.linalg.norm(np.roll(inner_xy, -1, axis=0) - inner_xy, axis=1)
+        mean_seg = float(np.mean(seg)) if seg.size else 1.0
+        if mean_seg <= 1e-6:
+            mean_seg = 1.0
+        step = max(1, int(round(spacing_cells / mean_seg)))
+        max_step = max(int(K / max(count, 1)), 1)
+        step = min(step, max_step)
+
+        scores = np.ones(K, dtype=float)
+        if ctx["wind_mag"] > 1e-9 and float(wind_bias) != 0.0:
+            align = v_unit @ ctx["wind_unit"]
+            scores *= np.exp(np.clip(float(wind_bias) * np.clip(align, -1.0, 1.0), -20.0, 20.0))
+        if float(value_bias) != 0.0:
+            scores *= np.exp(np.clip(float(value_bias) * ctx["value_scores"], -20.0, 20.0))
+        if float(control_bias) != 0.0:
+            scores *= np.exp(np.clip(float(control_bias) * ctx["control_scores"], -20.0, 20.0))
+
+        if centered:
+            half = count // 2
+            if count % 2 == 1:
+                offsets = np.arange(-half, half + 1, dtype=int)
+            else:
+                offsets = np.arange(-half, half, dtype=int)
+        else:
+            offsets = np.arange(0, count, dtype=int)
+
+        min_off = int(np.min(offsets)) * step
+        max_off = int(np.max(offsets)) * step
+        idx_pool = np.arange(K, dtype=int)
+        valid = idx_pool[(idx_pool + min_off >= 0) & (idx_pool + max_off < K)]
+        wrap = False
+        if valid.size == 0:
+            wrap = True
+            valid = idx_pool
+
+        w = scores.copy()
+        w = w[valid]
+        if float(w.sum()) <= 0.0:
+            start_idx = int(self.rng.choice(valid))
+        else:
+            p = w / float(w.sum())
+            start_idx = int(self.rng.choice(valid, p=p))
+
+        placements: list[list[float]] = []
+        orient = str(orientation).lower().strip()
+        for off in offsets:
+            idx = int(start_idx + int(off) * step)
+            if wrap:
+                idx %= K
+            p0 = inner_xy[idx]
+            v = v_out[idx]
+            v_len = float(np.linalg.norm(v))
+            if v_len > 1e-9 and offset_cells > 0.0:
+                alpha = min(1.0, offset_cells / v_len)
+                pt = p0 + v * alpha
+            else:
+                pt = p0
+            xg, yg = self.projector.snap(float(pt[0]), float(pt[1]))
+
+            if orient in ("normal", "perp", "perpendicular"):
+                u_long = v_unit[idx]
+                if float(np.linalg.norm(u_long)) <= 1e-9:
+                    u_long = normals[idx]
+            elif orient in ("wind", "downwind") and ctx["wind_mag"] > 1e-9:
+                u_long = ctx["wind_unit"]
+            else:
+                u_long = tangents[idx]
+
+            long_angle = float(np.arctan2(u_long[1], u_long[0]))
+            phi = self._phi_from_long_axis_angle(long_angle)
+            if phi_jitter_rad > 0.0:
+                phi = self._wrap_angle(phi + float(self.rng.normal(0.0, phi_jitter_rad)))
+            placements.append([xg, yg, phi])
+
+        return placements
+
     def _heuristic_boundary(
         self,
         count: int,
@@ -1169,6 +1445,13 @@ class RetardantDropBayesOpt:
         tangent_wind_scale: float = 2.0,
         tangent_shoulder_align: tuple[float, float] = (0.1, 0.6),
         tangent_orientation: str = "normal",
+        line_offset_cells: float | None = None,
+        line_overlap_frac: float = 0.2,
+        line_wind_bias: float = 2.0,
+        line_value_bias: float = 0.0,
+        line_control_bias: float = 0.0,
+        line_orientation: str = "tangent",
+        line_centered: bool = True,
         contingency_alpha_range: tuple[float, float] = (0.65, 0.95),
         point_offset_cells: float = 4.0,
         point_exclusion_cells: float = 6.0,
@@ -1190,6 +1473,7 @@ class RetardantDropBayesOpt:
           - fire-asset blocking between the fire front and high-value cells
           - downwind blocking ahead of the head fire
           - tangent/shoulder blocking offset from the fire front
+          - connected retardant line placements to build continuous barriers
           - boundary-based (wind-aware / value-aware, original behaviour)
           - POD/control-feature tie-in (control map biasing)
           - contingency-line allocation
@@ -1210,6 +1494,12 @@ class RetardantDropBayesOpt:
         modes = [str(m).lower().strip() for m in modes if str(m).strip()]
         if not modes:
             modes = ["boundary"]
+        alias_map = {
+            "connected_barrier": "connected_line",
+            "line_barrier": "connected_line",
+            "retardant_line": "connected_line",
+        }
+        modes = [alias_map.get(m, m) for m in modes]
 
         effective_enabled = "effective_interaction" in modes
         generator_modes = [m for m in modes if m != "effective_interaction"]
@@ -1341,6 +1631,21 @@ class RetardantDropBayesOpt:
                             orientation=tangent_orientation,
                         )
                     )
+                elif mode == "connected_line":
+                    placements.extend(
+                        self._heuristic_connected_line(
+                            cnt,
+                            ctx,
+                            offset_cells=line_offset_cells,
+                            overlap_frac=line_overlap_frac,
+                            wind_bias=line_wind_bias,
+                            value_bias=line_value_bias,
+                            control_bias=line_control_bias,
+                            phi_jitter_rad=phi_jitter_rad,
+                            orientation=line_orientation,
+                            centered=line_centered,
+                        )
+                    )
                 else:
                     # Unknown mode fallback: boundary drop.
                     placements.extend(self._heuristic_boundary(cnt, ctx, control_bias=0.0, **dict(base_boundary_kwargs)))
@@ -1449,6 +1754,350 @@ class RetardantDropBayesOpt:
         order = self.rng.permutation(X.shape[0])
         return X[order]
 
+    def sample_random_theta_polar(self, n: int = 1):
+        if n == 1:
+            return self.rng.random(self.dim)
+        return self.rng.random((n, self.dim))
+
+    def sample_local_theta_polar(
+        self,
+        anchors_theta: np.ndarray,
+        n: int,
+        *,
+        sigma_s: float = 0.05,
+        sigma_r: float = 0.05,
+        sigma_delta_rad: float = np.deg2rad(15.0),
+        resample_delta_prob: float = 0.05,
+    ) -> np.ndarray:
+        anchors_theta = np.atleast_2d(np.asarray(anchors_theta, dtype=float))
+        if anchors_theta.shape[0] < 1 or anchors_theta.shape[1] != self.dim:
+            raise ValueError(f"anchors_theta must have shape (*,{self.dim}); got {anchors_theta.shape}")
+
+        sigma_s = float(max(sigma_s, 0.0))
+        sigma_r = float(max(sigma_r, 0.0))
+        sigma_delta_rad = float(max(sigma_delta_rad, 0.0))
+        resample_delta_prob = float(np.clip(resample_delta_prob, 0.0, 1.0))
+
+        out = np.empty((max(int(n), 1), self.dim), dtype=float)
+        for i in range(out.shape[0]):
+            base = anchors_theta[int(self.rng.integers(0, anchors_theta.shape[0]))]
+            theta = np.empty(self.dim, dtype=float)
+            for d in range(self.n_drones):
+                s0 = float(base[3 * d + 0]) + float(self.rng.normal(0.0, sigma_s))
+                r0 = float(base[3 * d + 1]) + float(self.rng.normal(0.0, sigma_r))
+
+                if float(self.rng.random()) < resample_delta_prob:
+                    delta = float(self.rng.random()) * (2.0 * np.pi)
+                else:
+                    delta0 = float(base[3 * d + 2]) * (2.0 * np.pi)
+                    delta = self._wrap_angle(delta0 + float(self.rng.normal(0.0, sigma_delta_rad)))
+
+                theta[3 * d + 0] = np.clip(s0, 0.0, 1.0)
+                theta[3 * d + 1] = np.clip(r0, 0.0, 1.0)
+                theta[3 * d + 2] = delta / (2.0 * np.pi)
+            out[i] = np.clip(theta, 0.0, 1.0)
+
+        return out[0] if n == 1 else out
+
+    def _encode_sr_params(self, params: np.ndarray) -> np.ndarray:
+        params = np.asarray(params, dtype=float)
+        if params.ndim != 2 or params.shape[1] != 3:
+            raise ValueError(f"Expected SR params with shape (D,3); got {params.shape}")
+        theta = np.empty(self.dim, dtype=float)
+        for d, (s, r, delta) in enumerate(params):
+            theta[3 * d + 0] = float(np.clip(s, 0.0, 1.0))
+            theta[3 * d + 1] = float(np.clip(r, 0.0, 1.0))
+            theta[3 * d + 2] = self._wrap_angle(float(delta)) / (2.0 * np.pi)
+        return np.clip(theta, 0.0, 1.0)
+
+    def decode_theta_polar(self, theta: np.ndarray) -> np.ndarray:
+        if self.sr_grid is None:
+            raise RuntimeError("Call setup_search_grid_polar(...) before decode_theta_polar.")
+
+        theta = np.asarray(theta, dtype=float)
+        params = []
+        for d in range(self.n_drones):
+            s = float(theta[3 * d + 0])
+            r = float(theta[3 * d + 1])
+            delta = float(theta[3 * d + 2]) * (2.0 * np.pi)
+
+            xy, phi_s = self._sr_lookup(s, r)
+            phi_long = phi_s + delta
+            phi = self._phi_from_long_axis_angle(phi_long)
+            params.append((float(xy[0]), float(xy[1]), float(phi)))
+
+        params = np.array(params, dtype=float)
+        order = np.lexsort((params[:, 2], params[:, 1], params[:, 0]))
+        params = params[order]
+        return params
+
+    def theta_to_gp_features_polar(self, theta: np.ndarray) -> np.ndarray:
+        if self.sr_grid is None:
+            raise RuntimeError("Call setup_search_grid_polar(...) before theta_to_gp_features_polar.")
+        params = self.decode_theta_polar(theta)
+        nx, ny = self.shape if self.shape is not None else self.fire_model.env.grid_size
+        x = params[:, 0] / max(nx - 1, 1)
+        y = params[:, 1] / max(ny - 1, 1)
+        phi = params[:, 2]
+        feats = np.stack([x, y, np.sin(phi), np.cos(phi)], axis=1)
+        return feats.reshape(-1)
+
+    def _simulate_firestate_with_params(
+        self,
+        drone_params: np.ndarray,
+        *,
+        n_sims: int | None = None,
+        seed: int | None = None,
+    ) -> FireState:
+        n_sims = self.n_sims if n_sims is None else int(n_sims)
+        return self.fire_model.simulate_from_firestate(
+            self.init_firestate,
+            T=self.evolution_time_s,
+            n_sims=n_sims,
+            drone_params=drone_params,
+            ros_mps=self.fire_model.env.ros_mps,
+            wind_coeff=self.fire_model.env.wind_coeff,
+            diag=self.fire_model.env.diag,
+            seed=seed,
+            avoid_burning_drop=self.fire_model.env.avoid_burning_drop,
+            burning_prob_threshold=self.fire_model.env.avoid_drop_p_threshold,
+        )
+
+    def _expected_value_from_firestate(self, evolved_firestate: FireState) -> float:
+        p_burning = evolved_firestate.burning[0].astype(float, copy=False)
+        p_burned = evolved_firestate.burned[0].astype(float, copy=False)
+        p_affected = np.clip(p_burning + p_burned, 0.0, 1.0)
+
+        nx, _ = self.fire_model.env.grid_size
+        dx = self.fire_model.env.domain_km / nx
+        expected_value_burned = np.sum(p_affected * self.fire_model.env.value) * (dx ** 2)
+        return float(expected_value_burned)
+
+    def expected_value_burned_area_polar(self, theta: np.ndarray) -> float:
+        drone_params = self.decode_theta_polar(theta)
+        evolved_firestate = self._simulate_firestate_with_params(drone_params)
+        return self._expected_value_from_firestate(evolved_firestate)
+
+    def _sr_compact_scores(self, scores: np.ndarray, compactness: float) -> np.ndarray:
+        scores = np.asarray(scores, dtype=float)
+        compactness = float(np.clip(compactness, 0.0, 1.0))
+        if compactness >= 1.0 or scores.size == 0:
+            return scores
+        best = int(np.nanargmax(scores))
+        span = int(max(1, np.floor(compactness * scores.size)))
+        idx = np.arange(scores.size)
+        dist = np.minimum((idx - best) % scores.size, (best - idx) % scores.size)
+        out = np.full_like(scores, -np.inf, dtype=float)
+        out[dist <= span] = scores[dist <= span]
+        return out
+
+    def _sr_select_indices(self, scores: np.ndarray, count: int, min_arc_sep_frac: float) -> list[int]:
+        count = int(max(count, 0))
+        if count == 0:
+            return []
+        min_arc = self._min_arc_for_count(len(scores), count, min_arc_sep_frac)
+        return self._select_spaced_by_score(count, scores, min_arc=min_arc)
+
+    def _sr_value_blocking(
+        self,
+        *,
+        r_value: float,
+        count: int,
+        compactness: float,
+        min_arc_sep_frac: float,
+    ) -> list[tuple[float, float, float]]:
+        if self.sr_grid is None or self.sr_r_targets is None:
+            raise RuntimeError("Call setup_search_grid_polar(...) before SR heuristics.")
+
+        r_idx = int(round(float(r_value) * (self.sr_grid.shape[1] - 1)))
+        scores = np.zeros(self.sr_grid.shape[0], dtype=float)
+        for i in range(self.sr_grid.shape[0]):
+            p = self.sr_grid[i, r_idx]
+            if not np.isfinite(p[0]):
+                scores[i] = -np.inf
+                continue
+            xi = int(np.clip(round(p[0]), 0, self.shape[0] - 1))
+            yi = int(np.clip(round(p[1]), 0, self.shape[1] - 1))
+            scores[i] = float(self.fire_model.env.value[xi, yi])
+
+        scores = self._sr_compact_scores(scores, compactness)
+        idx = self._sr_select_indices(scores, count, min_arc_sep_frac)
+        return [(i / float(self.sr_grid.shape[0]), float(r_value), 0.0) for i in idx]
+
+    def _sr_downwind_blocking(
+        self,
+        *,
+        r_value: float,
+        count: int,
+        compactness: float,
+        min_arc_sep_frac: float,
+    ) -> list[tuple[float, float, float]]:
+        if self.init_boundary is None or self.sr_grid is None:
+            raise RuntimeError("Call setup_search_grid_polar(...) before SR heuristics.")
+        wind = self._estimate_mean_wind()
+        wind_unit = self._unit(wind)
+        inner_xy = np.asarray(self.init_boundary.xy, dtype=float)
+        scores = inner_xy @ wind_unit
+        scores = self._sr_compact_scores(scores, compactness)
+        idx = self._sr_select_indices(scores, count, min_arc_sep_frac)
+        return [(i / float(self.sr_grid.shape[0]), float(r_value), 0.0) for i in idx]
+
+    def _sr_surrounding(
+        self,
+        *,
+        r_value: float,
+        count: int,
+        grouping: int,
+        group_span_frac: float,
+    ) -> list[tuple[float, float, float]]:
+        if self.init_boundary is None or self.sr_grid is None:
+            raise RuntimeError("Call setup_search_grid_polar(...) before SR heuristics.")
+        grouping = int(max(grouping, 1))
+        K = self.sr_grid.shape[0]
+
+        if grouping == 1:
+            idx = np.linspace(0, K - 1, num=max(count, 1), dtype=int)
+            return [(int(i) / float(K), float(r_value), 0.0) for i in idx]
+
+        centers = np.linspace(0, K - 1, num=grouping, endpoint=False, dtype=int)
+        counts = [count // grouping] * grouping
+        for i in range(count % grouping):
+            counts[i] += 1
+
+        out: list[tuple[float, float, float]] = []
+        span = float(group_span_frac) * float(K)
+        for center, ccount in zip(centers, counts):
+            if ccount <= 0:
+                continue
+            offsets = np.linspace(-span / 2.0, span / 2.0, num=ccount, endpoint=False)
+            for off in offsets:
+                idx = int(np.round((center + off) % K))
+                out.append((idx / float(K), float(r_value), 0.0))
+        return out
+
+    def sample_initial_thetas_polar(
+        self,
+        n_init: int,
+        *,
+        heuristic_random_frac: float = 0.2,
+        heuristic_allocations: dict | None = None,
+        r_value: float = 0.6,
+        r_downwind: float = 0.8,
+        r_surround: float = 0.35,
+        compact_value: float = 0.4,
+        compact_downwind: float = 0.4,
+        min_arc_sep_frac: float = 0.25,
+        surrounding_grouping: int = 2,
+        surrounding_group_span: float = 0.2,
+        mix_prob: float = 0.35,
+        single_strategy_probs: dict | None = None,
+        random_mix_allocations: bool = True,
+        plot_runs: bool = False,
+        plot_n_sims: int | None = None,
+        plot_every: int = 1,
+        plot_title_prefix: str | None = None,
+    ) -> np.ndarray:
+        if n_init <= 0:
+            raise ValueError("n_init must be >= 1")
+        if self.sr_grid is None:
+            raise RuntimeError("Call setup_search_grid_polar(...) before polar sampling.")
+
+        heuristic_random_frac = float(np.clip(heuristic_random_frac, 0.0, 1.0))
+        n_rand = int(np.round(n_init * heuristic_random_frac))
+        n_heur = int(n_init - n_rand)
+
+        modes = ["value_blocking", "downwind_blocking", "surrounding"]
+        mix_prob = float(np.clip(mix_prob, 0.0, 1.0))
+        if single_strategy_probs is None:
+            probs = np.full(len(modes), 1.0 / len(modes), dtype=float)
+        else:
+            probs = np.array([float(single_strategy_probs.get(m, 0.0)) for m in modes], dtype=float)
+            total = float(np.sum(probs))
+            probs = probs / total if total > 0.0 else np.full(len(modes), 1.0 / len(modes), dtype=float)
+
+        thetas = []
+        for _ in range(max(n_heur, 0)):
+            if float(self.rng.random()) < mix_prob:
+                if heuristic_allocations is None and random_mix_allocations:
+                    weights = self.rng.random(len(modes))
+                    allocations = {m: float(w) for m, w in zip(modes, weights)}
+                else:
+                    allocations = heuristic_allocations or {}
+                counts = self._resolve_mode_counts(self.n_drones, modes, allocations)
+            else:
+                chosen = modes[int(self.rng.choice(len(modes), p=probs))]
+                counts = self._resolve_mode_counts(self.n_drones, modes, {chosen: 1.0})
+
+            placements: list[tuple[float, float, float]] = []
+            placements.extend(
+                self._sr_value_blocking(
+                    r_value=r_value,
+                    count=counts.get("value_blocking", 0),
+                    compactness=compact_value,
+                    min_arc_sep_frac=min_arc_sep_frac,
+                )
+            )
+            placements.extend(
+                self._sr_downwind_blocking(
+                    r_value=r_downwind,
+                    count=counts.get("downwind_blocking", 0),
+                    compactness=compact_downwind,
+                    min_arc_sep_frac=min_arc_sep_frac,
+                )
+            )
+            placements.extend(
+                self._sr_surrounding(
+                    r_value=r_surround,
+                    count=counts.get("surrounding", 0),
+                    grouping=surrounding_grouping,
+                    group_span_frac=surrounding_group_span,
+                )
+            )
+
+            if not placements:
+                theta = self.sample_random_theta_polar(1)
+            else:
+                params = np.asarray(placements, dtype=float)
+                if params.shape[0] > self.n_drones:
+                    idx = self.rng.permutation(params.shape[0])[: self.n_drones]
+                    params = params[idx]
+                elif params.shape[0] < self.n_drones:
+                    need = self.n_drones - params.shape[0]
+                    extra = self.rng.random((need, 3))
+                    extra[:, 2] *= 2.0 * np.pi
+                    params = np.vstack([params, extra])
+                theta = self._encode_sr_params(params)
+            thetas.append(theta)
+
+        if n_rand > 0:
+            rand = np.atleast_2d(self.sample_random_theta_polar(n_rand))
+            if thetas:
+                X = np.vstack([np.vstack(thetas), rand])
+            else:
+                X = rand
+        else:
+            X = np.vstack(thetas) if thetas else np.atleast_2d(self.sample_random_theta_polar(1))
+
+        order = self.rng.permutation(X.shape[0])
+        X = X[order]
+
+        if plot_runs:
+            total = X.shape[0]
+            plot_every = max(int(plot_every), 1)
+            for i, theta in enumerate(X, start=1):
+                if (i % plot_every) != 0:
+                    continue
+                objective = self.plot_evolved_firestate_polar(
+                    theta,
+                    n_sims=plot_n_sims,
+                    title_prefix=plot_title_prefix,
+                    run_idx=i,
+                    run_total=total,
+                )
+                print(f"[Init polar] run {i:03d}/{total} | objective={objective:.6g}")
+
+        return X
+
     def decode_theta(self, theta):
         if self.projector is None or self.shape is None:
             raise RuntimeError("Call setup_search_grid(...) before decode_theta / optimisation.")
@@ -1508,28 +2157,8 @@ class RetardantDropBayesOpt:
     def expected_value_burned_area(self, theta: np.ndarray) -> float:
         drone_params = self.decode_theta(theta)
         print("drone_params:", drone_params)
-        evolved_firestate = self.fire_model.simulate_from_firestate(
-            self.init_firestate,
-            T=self.evolution_time_s,
-            n_sims=self.n_sims,
-            drone_params=drone_params,
-            ros_mps=self.fire_model.env.ros_mps,
-            wind_coeff=self.fire_model.env.wind_coeff,
-            diag=self.fire_model.env.diag,
-            seed=None,
-            avoid_burning_drop=self.fire_model.env.avoid_burning_drop,
-            burning_prob_threshold=self.fire_model.env.avoid_drop_p_threshold,
-        )
-
-        p_burning = evolved_firestate.burning[0].astype(float, copy=False)
-        p_burned = evolved_firestate.burned[0].astype(float, copy=False)
-        p_affected = np.clip(p_burning + p_burned, 0.0, 1.0)
-
-        nx, _ = self.fire_model.env.grid_size
-        dx = self.fire_model.env.domain_km / nx
-
-        expected_value_burned = np.sum(p_affected * self.fire_model.env.value) * (dx ** 2)
-        return float(expected_value_burned)
+        evolved_firestate = self._simulate_firestate_with_params(drone_params)
+        return self._expected_value_from_firestate(evolved_firestate)
 
     def run_bayes_opt(
         self,
@@ -1677,6 +2306,169 @@ class RetardantDropBayesOpt:
         if verbose:
             print(f"[BO] done: best_y={best_y:.6g}")
             print(f"[BO] best params:\n{best_params}")
+
+        return best_theta, best_params, best_y, (X, y), y_nexts, y_bests
+
+    def run_bayes_opt_polar(
+        self,
+        n_init: int = 10,
+        n_iters: int = 30,
+        n_candidates: int = 5000,
+        xi: float = 0.01,
+        K_grid: int = 500,
+        boundary_field: str = "affected",
+        n_r: int = 160,
+        smooth_iters: int = 350,
+        omega: float = 1.0,
+        verbose: bool = True,
+        print_every: int = 1,
+        use_ard_kernel: bool = False,
+        init_strategy: str = "heuristic",  # "random", "heuristic"
+        init_heuristic_random_frac: float = 0.2,
+        init_heuristic_kwargs: dict | None = None,
+        candidate_strategy: str = "random",  # "random", "qmc", "mixed"
+        candidate_qmc: str = "sobol",
+        candidate_local_frac: float = 0.5,
+        candidate_local_top_k: int = 3,
+        candidate_local_sigma_s: float = 0.05,
+        candidate_local_sigma_r: float = 0.05,
+        candidate_local_sigma_delta_rad: float = np.deg2rad(15.0),
+        candidate_local_resample_delta_prob: float = 0.05,
+    ):
+        if self.sr_grid is None:
+            self.setup_search_grid_polar(
+                K=K_grid,
+                boundary_field=boundary_field,
+                n_r=n_r,
+                smooth_iters=smooth_iters,
+                omega=omega,
+            )
+            if verbose:
+                print(f"[BO polar] Search grid set up with {self.sr_grid.shape[0]}x{self.sr_grid.shape[1]} points.")
+                self.plot_polar_domain()
+
+        init_strategy = str(init_strategy).lower().strip()
+        if init_strategy == "random":
+            X_theta = self.sample_random_theta_polar(n_init)
+        elif init_strategy == "heuristic":
+            heuristic_kwargs = {} if init_heuristic_kwargs is None else dict(init_heuristic_kwargs)
+            X_theta = self.sample_initial_thetas_polar(
+                n_init=n_init,
+                heuristic_random_frac=init_heuristic_random_frac,
+                **heuristic_kwargs,
+            )
+        else:
+            raise ValueError("Unknown init strategy. Use 'random' or 'heuristic'.")
+
+        X_theta = np.atleast_2d(X_theta)
+        y = np.array([self.expected_value_burned_area_polar(th) for th in X_theta], dtype=float)
+        X = np.vstack([self.theta_to_gp_features_polar(th) for th in X_theta])
+
+        if verbose:
+            best0 = float(np.min(y))
+            print(f"[BO polar] init: n_init={n_init}, dim={self.dim}")
+            print(f"[BO polar] init: best_y={best0:.6g}, mean_y={float(np.mean(y)):.6g}, std_y={float(np.std(y)):.6g}")
+
+        if use_ard_kernel:
+            base_kernel = Matern(
+                length_scale=np.ones(X.shape[1], dtype=float),
+                nu=2.5,
+                length_scale_bounds=(1e-3, 1e3),
+            )
+        else:
+            base_kernel = TiedXYFiMatern(lx=0.2, ly=0.2, lphi=0.5, nu=2.5, length_scale_bounds=(1e-3, 1e3))
+
+        kernel = (
+            ConstantKernel(1.0, (1e-3, 1e3))
+            * base_kernel
+            + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-6, 1e2))
+        )
+
+        gp = GaussianProcessRegressor(
+            kernel=kernel,
+            normalize_y=True,
+            n_restarts_optimizer=2,
+            random_state=None,
+        )
+
+        y_nexts = []
+        y_bests = []
+
+        for it in range(1, n_iters + 1):
+            gp.fit(X, y)
+
+            cstrat = str(candidate_strategy).lower().strip()
+            if cstrat == "mixed":
+                local_frac = float(np.clip(candidate_local_frac, 0.0, 1.0))
+                n_local = int(np.round(n_candidates * local_frac))
+                n_global = int(n_candidates - n_local)
+                globals_ = self.sample_qmc_theta(n_global, method=candidate_qmc)
+
+                if n_local > 0:
+                    top_k = int(max(candidate_local_top_k, 1))
+                    best_idx = np.argsort(y)[:top_k]
+                    anchors = X_theta[best_idx]
+                    locals_ = self.sample_local_theta_polar(
+                        anchors,
+                        n_local,
+                        sigma_s=candidate_local_sigma_s,
+                        sigma_r=candidate_local_sigma_r,
+                        sigma_delta_rad=candidate_local_sigma_delta_rad,
+                        resample_delta_prob=candidate_local_resample_delta_prob,
+                    )
+                    Xcand_theta = np.vstack([np.atleast_2d(globals_), np.atleast_2d(locals_)])
+                else:
+                    Xcand_theta = np.atleast_2d(globals_)
+            elif cstrat == "qmc":
+                Xcand_theta = self.sample_qmc_theta(n_candidates, method=candidate_qmc)
+            elif cstrat == "random":
+                Xcand_theta = self.sample_random_theta_polar(n_candidates)
+            else:
+                raise ValueError("Unknown candidate_strategy for polar. Use 'random', 'qmc', or 'mixed'.")
+
+            Xcand_theta = np.atleast_2d(Xcand_theta)
+            Xcand = np.vstack([self.theta_to_gp_features_polar(th) for th in Xcand_theta])
+            y_best = float(np.min(y))
+            ei = expected_improvement(Xcand, gp, y_best=y_best, xi=xi)
+            best_ei_idx = int(np.argmax(ei))
+            theta_next = Xcand_theta[best_ei_idx]
+            x_next = Xcand[best_ei_idx]
+
+            mu_next, std_next = gp.predict(x_next[None, :], return_std=True)
+            mu_next = float(mu_next[0])
+            std_next = float(std_next[0])
+
+            y_next = float(self.expected_value_burned_area_polar(theta_next))
+
+            X_theta = np.vstack([X_theta, theta_next])
+            X = np.vstack([X, x_next])
+            y = np.append(y, y_next)
+
+            if verbose and (it % max(print_every, 1) == 0 or it == 1 or it == n_iters):
+                improved = y_next < y_best
+                ei_max = float(ei[best_ei_idx])
+                print(
+                    f"[BO polar] iter {it:03d}/{n_iters} | "
+                    f"y_next={y_next:.6g} | best_y={float(np.min(y)):.6g} "
+                    f"({'improved' if improved else 'no-improve'}) | "
+                    f"EI_max={ei_max:.3g} | mu={mu_next:.6g} | std={std_next:.3g}"
+                )
+                print(f"      objective (expected value burned) = {y_next:.6g}")
+                params = self.decode_theta_polar(theta_next)
+                print(f"      proposed (x,y,phi) per drone:\n      {params}")
+                print(f"      gp.kernel_ = {gp.kernel_}")
+
+            y_nexts.append(y_next)
+            y_bests.append(float(np.min(y)))
+
+        best_idx = int(np.argmin(y))
+        best_theta = X_theta[best_idx]
+        best_params = self.decode_theta_polar(best_theta)
+        best_y = float(y[best_idx])
+
+        if verbose:
+            print(f"[BO polar] done: best_y={best_y:.6g}")
+            print(f"[BO polar] best params:\n{best_params}")
 
         return best_theta, best_params, best_y, (X, y), y_nexts, y_bests
 
@@ -1832,6 +2624,43 @@ class RetardantDropBayesOpt:
             kind="retardant",
             title=title if title is not None else "Corresponding Retardant Locations",
         )
+
+    def plot_evolved_firestate_polar(
+        self,
+        theta: np.ndarray,
+        *,
+        n_sims: int | None = None,
+        title_prefix: str | None = None,
+        run_idx: int | None = None,
+        run_total: int | None = None,
+    ) -> float:
+        drone_params = self.decode_theta_polar(theta)
+        evolved_firestate = self._simulate_firestate_with_params(drone_params, n_sims=n_sims)
+        objective = self._expected_value_from_firestate(evolved_firestate)
+
+        prefix = title_prefix if title_prefix is not None else "Polar placement"
+        if run_idx is not None and run_total is not None:
+            prefix = f"{prefix} {run_idx}/{run_total}"
+        base_title = f"{prefix} | objective={objective:.6g}"
+
+        self.fire_model.plot_firestate(
+            self.init_firestate,
+            kind="p_affected",
+            title=f"{base_title} | initial",
+        )
+
+        self.fire_model.plot_firestate(
+            evolved_firestate,
+            kind="p_affected",
+            title=f"{base_title} | evolved",
+        )
+
+        self.fire_model.plot_firestate(
+            evolved_firestate,
+            kind="retardant",
+            title=f"{base_title} | retardant",
+        )
+        return objective
 
 
 __all__ = [
