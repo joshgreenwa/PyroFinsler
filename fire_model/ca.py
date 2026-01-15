@@ -354,8 +354,11 @@ class CAFireModel:
                 burning_union = burning2d.astype(bool, copy=False)
 
         for x0, y0, phi in drone_params:
-            xp = X - x0
-            yp = Y - y0
+            # Convert km coordinates to grid coordinates
+            x0_grid = x0 / self.dx
+            y0_grid = y0 / self.dx
+            xp = X - x0_grid
+            yp = Y - y0_grid
 
             c = np.cos(phi)
             s = np.sin(phi)
