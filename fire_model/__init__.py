@@ -16,6 +16,7 @@ from fire_model.harmonic import (
     plot_boundary_correspondence,
 )
 from fire_model.bo import RetardantDropBayesOpt, SearchGridProjector, TiedXYFiMatern, expected_improvement
+from fire_model.bo_sr import RetardantDropBayesOptSR, TiedSRDeltaMatern
 
 __all__ = [
     "CAFireModel",
@@ -37,4 +38,6 @@ __all__ = [
     "SearchGridProjector",
     "TiedXYFiMatern",
     "expected_improvement",
+    "RetardantDropBayesOptSR",
+    "TiedSRDeltaMatern",
 ]

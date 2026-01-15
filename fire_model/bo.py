@@ -351,6 +351,8 @@ class RetardantDropBayesOpt:
         n_s_lines: int = 12,
         n_r_lines: int = 8,
         show_fields: bool = True,
+        show_diagnostics: bool = True,
+        hist_bins: int = 40,
     ):
         if self.sr_grid is None or self.sr_r_targets is None:
             raise RuntimeError("Polar grid not initialised; call setup_search_grid_polar(...).")
@@ -412,6 +414,46 @@ class RetardantDropBayesOpt:
         ax2.set_xticks([])
         ax2.set_yticks([])
         plt.colorbar(im2, ax=ax2, fraction=0.046)
+
+        plt.tight_layout()
+        plt.show()
+
+        if not show_diagnostics:
+            return
+
+        dist, nn = tree.query(coords, k=1)
+        s_idx = idxs[nn, 0]
+        r_idx = idxs[nn, 1]
+
+        counts = np.zeros(grid.shape[:2], dtype=int)
+        np.add.at(counts, (s_idx, r_idx), 1)
+
+        density_field = np.full(mask.shape, np.nan)
+        density_field[coords[:, 0].astype(int), coords[:, 1].astype(int)] = counts[s_idx, r_idx]
+
+        dist_field = np.full(mask.shape, np.nan)
+        dist_field[coords[:, 0].astype(int), coords[:, 1].astype(int)] = dist
+
+        fig2, axes2 = plt.subplots(1, 3, figsize=(14, 4))
+        axd = axes2[0]
+        imd = axd.imshow(density_field.T, origin="lower", aspect="equal", cmap="viridis")
+        axd.set_title("Mask points per grid point")
+        axd.set_xticks([])
+        axd.set_yticks([])
+        plt.colorbar(imd, ax=axd, fraction=0.046)
+
+        axdist = axes2[1]
+        imdist = axdist.imshow(dist_field.T, origin="lower", aspect="equal", cmap="magma")
+        axdist.set_title("Distance to nearest grid point")
+        axdist.set_xticks([])
+        axdist.set_yticks([])
+        plt.colorbar(imdist, ax=axdist, fraction=0.046)
+
+        axh = axes2[2]
+        axh.hist(dist, bins=max(int(hist_bins), 5), color="tab:blue", alpha=0.8)
+        axh.set_title("Distance histogram")
+        axh.set_xlabel("Distance (cells)")
+        axh.set_ylabel("Count")
 
         plt.tight_layout()
         plt.show()
@@ -1878,6 +1920,68 @@ class RetardantDropBayesOpt:
         evolved_firestate = self._simulate_firestate_with_params(drone_params)
         return self._expected_value_from_firestate(evolved_firestate)
 
+    @staticmethod
+    def _sr_arc_length(boundary_xy: np.ndarray) -> np.ndarray:
+        seg = np.diff(np.vstack([boundary_xy, boundary_xy[0]]), axis=0)
+        seg_len = np.hypot(seg[:, 0], seg[:, 1])
+        return np.concatenate([[0.0], np.cumsum(seg_len[:-1])])
+
+    @staticmethod
+    def _sr_restrict_by_compactness(scores: np.ndarray, arc_len: np.ndarray, compactness: float) -> np.ndarray:
+        compactness = float(np.clip(compactness, 0.0, 1.0))
+        if compactness >= 1.0:
+            return scores
+        best = int(np.nanargmax(scores))
+        total = float(arc_len[-1])
+        if total <= 0.0:
+            return scores
+        span = compactness * total
+        out = np.full_like(scores, -np.inf, dtype=float)
+        for i in range(len(scores)):
+            d = abs(arc_len[i] - arc_len[best])
+            d = min(d, total - d)
+            if d <= span:
+                out[i] = scores[i]
+        return out
+
+    @staticmethod
+    def _sr_greedy_select_indices(
+        scores: np.ndarray,
+        arc_len: np.ndarray,
+        min_spacing: float,
+        n_keep: int,
+    ) -> list[int]:
+        order = np.argsort(scores)[::-1]
+        selected: list[int] = []
+        total = float(arc_len[-1])
+        if total <= 0.0:
+            return [int(i) for i in order[: max(int(n_keep), 0)]]
+        for idx in order:
+            if not np.isfinite(scores[idx]):
+                continue
+            ok = True
+            for sidx in selected:
+                d = abs(arc_len[idx] - arc_len[sidx])
+                d = min(d, total - d)
+                if d < min_spacing:
+                    ok = False
+                    break
+            if ok:
+                selected.append(int(idx))
+            if len(selected) >= n_keep:
+                break
+        return selected
+
+    @staticmethod
+    def _sr_indices_by_arclength(arc_len: np.ndarray, n_keep: int) -> list[int]:
+        total = float(arc_len[-1])
+        if total <= 0.0:
+            return [0 for _ in range(max(int(n_keep), 0))]
+        targets = np.linspace(0.0, total, int(n_keep), endpoint=False)
+        idx = np.searchsorted(arc_len, targets)
+        idx = np.clip(idx, 0, len(arc_len) - 1)
+        return [int(i) for i in idx]
+
     def _sr_compact_scores(self, scores: np.ndarray, compactness: float) -> np.ndarray:
         scores = np.asarray(scores, dtype=float)
         compactness = float(np.clip(compactness, 0.0, 1.0))
@@ -1904,9 +2008,10 @@ class RetardantDropBayesOpt:
         r_value: float,
         count: int,
         compactness: float,
-        min_arc_sep_frac: float,
+        min_spacing: float | None = None,
+        min_arc_sep_frac: float | None = None,
     ) -> list[tuple[float, float, float]]:
-        if self.sr_grid is None or self.sr_r_targets is None:
+        if self.sr_grid is None or self.sr_r_targets is None or self.init_boundary is None:
             raise RuntimeError("Call setup_search_grid_polar(...) before SR heuristics.")
 
         r_idx = int(round(float(r_value) * (self.sr_grid.shape[1] - 1)))
@@ -1920,8 +2025,14 @@ class RetardantDropBayesOpt:
             yi = int(np.clip(round(p[1]), 0, self.shape[1] - 1))
             scores[i] = float(self.fire_model.env.value[xi, yi])
 
-        scores = self._sr_compact_scores(scores, compactness)
-        idx = self._sr_select_indices(scores, count, min_arc_sep_frac)
+        arc_len = self._sr_arc_length(np.asarray(self.init_boundary.xy, dtype=float))
+        if min_spacing is None:
+            frac = 0.0 if min_arc_sep_frac is None else float(min_arc_sep_frac)
+            total = float(arc_len[-1])
+            per = total / max(count, 1) if total > 0.0 else 0.0
+            min_spacing = frac * per
+        scores = self._sr_restrict_by_compactness(scores, arc_len, compactness)
+        idx = self._sr_greedy_select_indices(scores, arc_len, float(min_spacing), int(count))
         return [(i / float(self.sr_grid.shape[0]), float(r_value), 0.0) for i in idx]
 
     def _sr_downwind_blocking(
@@ -1930,7 +2041,8 @@ class RetardantDropBayesOpt:
         r_value: float,
         count: int,
         compactness: float,
-        min_arc_sep_frac: float,
+        min_spacing: float | None = None,
+        min_arc_sep_frac: float | None = None,
     ) -> list[tuple[float, float, float]]:
         if self.init_boundary is None or self.sr_grid is None:
             raise RuntimeError("Call setup_search_grid_polar(...) before SR heuristics.")
@@ -1938,8 +2050,14 @@ class RetardantDropBayesOpt:
         wind_unit = self._unit(wind)
         inner_xy = np.asarray(self.init_boundary.xy, dtype=float)
         scores = inner_xy @ wind_unit
-        scores = self._sr_compact_scores(scores, compactness)
-        idx = self._sr_select_indices(scores, count, min_arc_sep_frac)
+        arc_len = self._sr_arc_length(inner_xy)
+        if min_spacing is None:
+            frac = 0.0 if min_arc_sep_frac is None else float(min_arc_sep_frac)
+            total = float(arc_len[-1])
+            per = total / max(count, 1) if total > 0.0 else 0.0
+            min_spacing = frac * per
+        scores = self._sr_restrict_by_compactness(scores, arc_len, compactness)
+        idx = self._sr_greedy_select_indices(scores, arc_len, float(min_spacing), int(count))
         return [(i / float(self.sr_grid.shape[0]), float(r_value), 0.0) for i in idx]
 
     def _sr_surrounding(
@@ -1954,24 +2072,31 @@ class RetardantDropBayesOpt:
             raise RuntimeError("Call setup_search_grid_polar(...) before SR heuristics.")
         grouping = int(max(grouping, 1))
         K = self.sr_grid.shape[0]
+        arc_len = self._sr_arc_length(np.asarray(self.init_boundary.xy, dtype=float))
 
         if grouping == 1:
-            idx = np.linspace(0, K - 1, num=max(count, 1), dtype=int)
+            idx = self._sr_indices_by_arclength(arc_len, max(count, 1))
             return [(int(i) / float(K), float(r_value), 0.0) for i in idx]
 
-        centers = np.linspace(0, K - 1, num=grouping, endpoint=False, dtype=int)
+        centers = self._sr_indices_by_arclength(arc_len, grouping)
         counts = [count // grouping] * grouping
         for i in range(count % grouping):
             counts[i] += 1
 
         out: list[tuple[float, float, float]] = []
-        span = float(group_span_frac) * float(K)
+        total = float(arc_len[-1])
+        span = float(group_span_frac) * total if total > 0.0 else 0.0
         for center, ccount in zip(centers, counts):
             if ccount <= 0:
                 continue
-            offsets = np.linspace(-span / 2.0, span / 2.0, num=ccount, endpoint=False)
-            for off in offsets:
-                idx = int(np.round((center + off) % K))
+            targets = np.linspace(-span / 2.0, span / 2.0, num=ccount, endpoint=False)
+            for t in targets:
+                if total <= 0.0:
+                    idx = 0
+                else:
+                    target_len = (arc_len[center] + t) % total
+                    idx = int(np.searchsorted(arc_len, target_len))
+                    idx = min(idx, len(arc_len) - 1)
                 out.append((idx / float(K), float(r_value), 0.0))
         return out
 
@@ -1987,6 +2112,7 @@ class RetardantDropBayesOpt:
         compact_value: float = 0.4,
         compact_downwind: float = 0.4,
         min_arc_sep_frac: float = 0.25,
+        min_spacing: float | None = None,
         surrounding_grouping: int = 2,
         surrounding_group_span: float = 0.2,
         mix_prob: float = 0.35,
@@ -2035,6 +2161,7 @@ class RetardantDropBayesOpt:
                     count=counts.get("value_blocking", 0),
                     compactness=compact_value,
                     min_arc_sep_frac=min_arc_sep_frac,
+                    min_spacing=min_spacing,
                 )
             )
             placements.extend(
@@ -2043,6 +2170,7 @@ class RetardantDropBayesOpt:
                     count=counts.get("downwind_blocking", 0),
                     compactness=compact_downwind,
                     min_arc_sep_frac=min_arc_sep_frac,
+                    min_spacing=min_spacing,
                 )
             )
             placements.extend(
