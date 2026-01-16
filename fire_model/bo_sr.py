@@ -460,25 +460,24 @@ class RetardantDropBayesOptSR:
             raise RuntimeError("Call setup_search_grid_sr(...) before SR heuristics.")
 
         value_grid = self._sr_value_grid()
-        if r_value is None:
-            value_filled = np.where(np.isfinite(value_grid), value_grid, -np.inf)
+        valid = np.isfinite(value_grid)
+        if not np.any(valid):
+            return []
+
+        background = float(np.nanmin(value_grid)) if value_offset is None else float(value_offset)
+        value_rel = np.where(valid, value_grid - background, np.nan)
+        weights_grid = np.where(value_rel > 0.0, value_rel, 0.0)
+        weights_grid = np.power(weights_grid, float(value_power))
+
+        if np.any(weights_grid > 0.0):
+            r_idx = np.argmax(weights_grid, axis=1)
+            scores = weights_grid[np.arange(weights_grid.shape[0]), r_idx]
+            scores = np.where(scores > 0.0, scores, -np.inf)
+        else:
+            value_filled = np.where(valid, value_grid, -np.inf)
             r_idx = np.argmax(value_filled, axis=1)
             scores = value_filled[np.arange(value_filled.shape[0]), r_idx]
-            scores = np.where(np.isfinite(scores), scores, np.nan)
-            r_base = self.sr_r_targets[np.clip(r_idx, 0, len(self.sr_r_targets) - 1)]
-        else:
-            r_idx = int(round(float(r_value) * (self.sr_grid.shape[1] - 1)))
-            scores = value_grid[:, r_idx]
-            r_base = np.full(value_grid.shape[0], float(r_value), dtype=float)
-
-        finite_scores = scores[np.isfinite(scores)]
-        if finite_scores.size == 0:
-            scores = np.zeros_like(scores)
-        else:
-            offset = float(np.min(finite_scores)) if value_offset is None else float(value_offset)
-            scores = np.where(np.isfinite(scores), scores, offset)
-            scores = np.clip(scores - offset, 0.0, None)
-            scores = np.power(scores, float(value_power))
+            scores = np.where(np.isfinite(scores), scores, 0.0)
 
         arc_len = self._sr_arc_length(np.asarray(self.init_boundary.xy, dtype=float))
         if min_spacing is None:
@@ -524,6 +523,11 @@ class RetardantDropBayesOptSR:
                     if d < min_spacing:
                         scores_work[j] = 0.0
 
+        r_base = (
+            self.sr_r_targets[np.clip(r_idx, 0, len(self.sr_r_targets) - 1)]
+            if r_value is None
+            else np.full(value_grid.shape[0], float(r_value), dtype=float)
+        )
         out = []
         for i in idx:
             r = float(np.clip(float(r_base[i]) + float(r_offset), 0.0, 1.0))
