@@ -342,10 +342,18 @@ class CAFireModel:
             if not (0.0 <= thr <= 1.0):
                 raise ValueError("burning_prob_threshold must be in [0,1].")
             burning = np.asarray(state.burning)
+            burning = np.asarray(state.burning)
             if burning.ndim == 2:
                 burning2d = burning
             elif burning.ndim == 3:
-                burning2d = burning.any(axis=0)
+                # IMPORTANT: if `state.burning` is probabilistic (float), we must NOT
+                # collapse with `.any(axis=0)` (that would treat any non-zero prob as
+                # "burning" and incorrectly wipe out most of the drop footprint).
+                # Instead, form a conservative probability envelope with max over sims.
+                if np.issubdtype(burning.dtype, np.floating):
+                    burning2d = np.max(burning, axis=0)
+                else:
+                    burning2d = burning.any(axis=0)
             else:
                 raise ValueError(f"state.burning must have shape (nx,ny) or (n_sims,nx,ny); got {burning.shape}")
             if np.issubdtype(burning2d.dtype, np.floating):
@@ -353,10 +361,16 @@ class CAFireModel:
             else:
                 burning_union = burning2d.astype(bool, copy=False)
 
+        domain_km = float(getattr(self.env, "domain_km", 0.0) or 0.0)
+
         for x0, y0, phi in drone_params:
-            # Convert km coordinates to grid coordinates
-            x0_grid = x0 / self.dx
-            y0_grid = y0 / self.dx
+            # Accept either km or grid coordinates; infer based on domain size.
+            if domain_km > 0.0 and (x0 > domain_km or y0 > domain_km):
+                x0_grid = x0
+                y0_grid = y0
+            else:
+                x0_grid = x0 / self.dx
+                y0_grid = y0 / self.dx
             xp = X - x0_grid
             yp = Y - y0_grid
 

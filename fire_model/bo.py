@@ -154,6 +154,7 @@ class RetardantDropBayesOpt:
         fire_model: CAFireModel,
         init_firestate: FireState,
         n_drones: int,
+        drop_time_s: float,
         evolution_time_s: float,
         n_sims: int,
         fire_boundary_probability: float = 0.25,
@@ -163,10 +164,13 @@ class RetardantDropBayesOpt:
         self.fire_model = fire_model
         self.init_firestate = init_firestate
         self.n_drones = n_drones
+        self.drop_time_s = float(drop_time_s)
         self.dim = 3 * n_drones
         self.evolution_time_s = evolution_time_s
         self.search_grid_evolution_time_s = search_grid_evolution_time_s
         self.n_sims = n_sims
+        self._drop_firestate: FireState | None = None
+        
         self.p_boundary = fire_boundary_probability
         self.rng = default_rng() if rng is None else rng
 
@@ -227,16 +231,41 @@ class RetardantDropBayesOpt:
         if burning.any():
             return np.mean(w0[burning], axis=0)
         return np.mean(w0.reshape(-1, 2), axis=0)
+    
+    def _get_drop_firestate(self) -> FireState:
+        """
+        Returns the firestate at decision time (t = drop_time_s) with NO retardant.
+        Cached because BO calls the objective many times.
+        """
+        if self.drop_time_s <= 0.0:
+            return self.init_firestate
+
+        if self._drop_firestate is None:
+            self._drop_firestate = self.fire_model.simulate_from_firestate(
+                self.init_firestate,
+                T=self.drop_time_s,
+                n_sims=self.n_sims,
+                drone_params=None,  # IMPORTANT: no retardant before decision time
+                ros_mps=self.fire_model.env.ros_mps,
+                wind_coeff=self.fire_model.env.wind_coeff,
+                diag=self.fire_model.env.diag,
+                seed=None,
+                avoid_burning_drop=self.fire_model.env.avoid_burning_drop,
+                burning_prob_threshold=self.fire_model.env.avoid_drop_p_threshold,
+            )
+        return self._drop_firestate
+
 
     def generate_search_grid(self, K=500, boundary_field="affected"):
         if self.search_grid_evolution_time_s is not None:
             T = self.search_grid_evolution_time_s
         else:
             T = self.evolution_time_s
+        init_state = self._get_drop_firestate()
         search = self.fire_model.generate_search_domain(
             T=T,
             n_sims=self.n_sims,
-            init_firestate=self.init_firestate,
+            init_firestate=init_state,
             ros_mps=self.fire_model.env.ros_mps,
             wind_coeff=self.fire_model.env.wind_coeff,
             diag=self.fire_model.env.diag,
@@ -603,8 +632,9 @@ class RetardantDropBayesOpt:
         value_scores = self._sample_map_along(value_map, inner_xy, v_out, alpha=score_alpha)
         control_scores = self._sample_map_along(ctrl_map, inner_xy, v_out, alpha=score_alpha) if ctrl_map is not None else np.zeros_like(value_scores)
 
-        init_burning = np.asarray(self.init_firestate.burning, dtype=float)
-        init_burned = np.asarray(self.init_firestate.burned, dtype=float)
+        drop_state = self._get_drop_firestate()
+        init_burning = np.asarray(drop_state.burning, dtype=float)
+        init_burned = np.asarray(drop_state.burned, dtype=float)
         if init_burning.ndim == 3:
             init_burning = init_burning[0]
         if init_burned.ndim == 3:
@@ -1226,12 +1256,16 @@ class RetardantDropBayesOpt:
         exclusion_cells: float,
         asset_wind_blend: float,
         min_value_quantile: float,
+        risk_threshold: float = 0.10,
         pos_jitter_cells: float = 0.0,
         phi_jitter_rad: float = 0.0,
     ) -> list[list[float]]:
         if count <= 0:
             return []
         value_map = ctx["value_map"]
+        pf = ctx.get("p_final", None)
+        p_final = None if pf is None else np.asarray(pf, dtype=float)
+        risk_threshold = float(np.clip(risk_threshold, 0.0, 1.0))
         nx, ny = value_map.shape
         flat = value_map.ravel()
         if float(np.max(flat)) <= 0.0:
@@ -1255,6 +1289,9 @@ class RetardantDropBayesOpt:
             if val < thresh:
                 break
             xi, yi = np.unravel_index(int(idx), (nx, ny))
+            if p_final is not None:
+                if float(p_final[xi, yi]) < risk_threshold:
+                    continue
             pos = np.array([float(xi), float(yi)], dtype=float)
             if any(np.linalg.norm(pos - c) < exclusion_cells for c in centers):
                 continue
@@ -2282,11 +2319,42 @@ class RetardantDropBayesOpt:
         feats = np.stack([x, y, np.sin(phi), np.cos(phi)], axis=1)
         return feats.reshape(-1)
 
-    def expected_value_burned_area(self, theta: np.ndarray) -> float:
+    def expected_value_burned_area_old(self, theta: np.ndarray) -> float:
         drone_params = self.decode_theta(theta)
         print("drone_params:", drone_params)
         evolved_firestate = self._simulate_firestate_with_params(drone_params)
         return self._expected_value_from_firestate(evolved_firestate)
+    
+    def expected_value_burned_area(self, theta: np.ndarray) -> float:
+        # Retardant is applied once at the START of simulate_from_firestate.
+        # To model a drop at t = drop_time_s, we first simulate to decision time
+        # with no retardant, then apply the drop and simulate forward.
+        drone_params = self.decode_theta(theta)
+
+        init_state = self._get_drop_firestate()  # <-- KEY CHANGE
+
+        evolved_firestate = self.fire_model.simulate_from_firestate(
+            init_state,
+            T=self.evolution_time_s,
+            n_sims=self.n_sims,
+            drone_params=drone_params,  # retardant applied here == at t = drop_time_s
+            ros_mps=self.fire_model.env.ros_mps,
+            wind_coeff=self.fire_model.env.wind_coeff,
+            diag=self.fire_model.env.diag,
+            seed=None,
+            avoid_burning_drop=self.fire_model.env.avoid_burning_drop,
+            burning_prob_threshold=self.fire_model.env.avoid_drop_p_threshold,
+        )
+
+        p_burning = evolved_firestate.burning[0].astype(float, copy=False)
+        p_burned  = evolved_firestate.burned[0].astype(float, copy=False)
+        p_affected = np.clip(p_burning + p_burned, 0.0, 1.0)
+
+        nx, _ = self.fire_model.env.grid_size
+        dx = self.fire_model.env.domain_km / nx
+        expected_value_burned = np.sum(p_affected * self.fire_model.env.value) * (dx ** 2)
+        return float(expected_value_burned)
+
 
     def run_bayes_opt(
         self,
