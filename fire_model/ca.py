@@ -377,8 +377,9 @@ class CAFireModel:
             c = np.cos(phi)
             s = np.sin(phi)
 
-            xr = c * xp + s * yp
-            yr = -s * xp + c * yp
+            # Use standard CCW rotation so long-axis orientation matches SR convention.
+            xr = c * xp - s * yp
+            yr = s * xp + c * yp
 
             mask = (np.abs(xr) <= half_w) & (np.abs(yr) <= half_h)
             if burning_union is not None:

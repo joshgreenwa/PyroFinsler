@@ -155,7 +155,8 @@ class RetardantDropBayesOptSR:
 
         self.sr_grid: np.ndarray | None = None
         self.sr_r_targets: np.ndarray | None = None
-        self.sr_phi_grid: np.ndarray | None = None
+        self.sr_phi_s_grid: np.ndarray | None = None
+        self.sr_phi_r_grid: np.ndarray | None = None
         self.sr_valid_mask: np.ndarray | None = None
         self.sr_index_tree: cKDTree | None = None
         self.sr_valid_indices: np.ndarray | None = None
@@ -179,6 +180,31 @@ class RetardantDropBayesOptSR:
         with the rotated y'-axis, i.e. long-axis direction is `[sin(phi), cos(phi)]`.
         """
         return cls._wrap_angle(0.5 * np.pi - float(long_axis_angle))
+
+    def _estimate_mean_wind(self) -> np.ndarray:
+        env = self.fire_model.env
+        wind = getattr(env, "wind", None)
+        if wind is None:
+            return np.zeros(2, dtype=float)
+
+        w = np.asarray(wind, dtype=float)
+        if w.ndim == 4:
+            idx = int(np.clip(int(self.init_firestate.t), 0, w.shape[0] - 1))
+            w0 = w[idx]
+        else:
+            w0 = w
+        if w0.ndim != 3 or w0.shape[-1] != 2:
+            return np.zeros(2, dtype=float)
+
+        burning = np.asarray(self.init_firestate.burning)
+        if burning.ndim == 3:
+            burning = burning[0]
+        if np.issubdtype(burning.dtype, np.floating):
+            burning = burning > 0.5
+
+        if burning.any():
+            return np.mean(w0[burning], axis=0)
+        return np.mean(w0.reshape(-1, 2), axis=0)
 
     def _simulate_firestate_with_params(
         self,
@@ -263,6 +289,11 @@ class RetardantDropBayesOptSR:
         d = np.roll(grid, -1, axis=0) - np.roll(grid, 1, axis=0)
         return np.arctan2(d[..., 1], d[..., 0])
 
+    @staticmethod
+    def _grid_angle_along_r(grid: np.ndarray) -> np.ndarray:
+        d = np.roll(grid, -1, axis=1) - np.roll(grid, 1, axis=1)
+        return np.arctan2(d[..., 1], d[..., 0])
+
     def setup_search_grid_sr(
         self,
         *,
@@ -296,14 +327,15 @@ class RetardantDropBayesOptSR:
 
         self.sr_grid = grid
         self.sr_r_targets = r_targets
-        self.sr_phi_grid = self._grid_angle_along_s(grid)
+        self.sr_phi_s_grid = self._grid_angle_along_s(grid)
+        self.sr_phi_r_grid = self._grid_angle_along_r(grid)
         self.sr_valid_mask = valid
         self.sr_valid_indices = idx.astype(float)
         self.sr_index_tree = cKDTree(self.sr_valid_indices)
         return grid
 
     def _sr_lookup(self, s: float, r: float) -> tuple[np.ndarray, float]:
-        if self.sr_grid is None or self.sr_phi_grid is None or self.sr_index_tree is None:
+        if self.sr_grid is None or self.sr_phi_r_grid is None or self.sr_index_tree is None:
             raise RuntimeError("SR grid not initialised; call setup_search_grid_sr(...).")
 
         grid = self.sr_grid
@@ -321,7 +353,7 @@ class RetardantDropBayesOptSR:
             j = int(self.sr_valid_indices[idx, 1])
 
         xy = grid[i, j]
-        phi = float(self.sr_phi_grid[i, j])
+        phi = float(self.sr_phi_r_grid[i, j])
         return xy, phi
 
     def decode_theta_sr(self, theta: np.ndarray) -> np.ndarray:
@@ -347,8 +379,9 @@ class RetardantDropBayesOptSR:
             r = float(theta[3 * d + 1])
             delta = float(theta[3 * d + 2]) * (2.0 * np.pi)
 
-            xy, phi_s = self._sr_lookup(s, r)
-            phi_long = phi_s + delta
+            xy, phi_r = self._sr_lookup(s, r)
+            # Align delta=0 with the tangent (constant-r) direction.
+            phi_long = phi_r + delta + 0.5 * np.pi
             phi = self._phi_from_long_axis_angle(phi_long)
             params.append((float(xy[0]), float(xy[1]), float(phi)))
 
@@ -446,17 +479,15 @@ class RetardantDropBayesOptSR:
     def _sr_value_blocking(
         self,
         *,
-        r_value: float | None = None,
-        r_offset: float = 0.0,
         count: int,
-        compactness: float,
-        min_spacing: float | None = None,
-        min_arc_sep_frac: float | None = None,
         value_power: float = 1.0,
         value_offset: float | None = None,
         selection: str = "weighted",
+        r_offset: float = 0.0,
+        jitter_s: float = 0.0,
+        jitter_delta_rad: float = 0.0,
     ) -> list[tuple[float, float, float]]:
-        if self.sr_grid is None or self.sr_r_targets is None or self.init_boundary is None:
+        if self.sr_grid is None or self.sr_r_targets is None:
             raise RuntimeError("Call setup_search_grid_sr(...) before SR heuristics.")
 
         value_grid = self._sr_value_grid()
@@ -469,69 +500,56 @@ class RetardantDropBayesOptSR:
         weights_grid = np.where(value_rel > 0.0, value_rel, 0.0)
         weights_grid = np.power(weights_grid, float(value_power))
 
-        if np.any(weights_grid > 0.0):
-            r_idx = np.argmax(weights_grid, axis=1)
-            scores = weights_grid[np.arange(weights_grid.shape[0]), r_idx]
-            scores = np.where(scores > 0.0, scores, -np.inf)
-        else:
-            value_filled = np.where(valid, value_grid, -np.inf)
-            r_idx = np.argmax(value_filled, axis=1)
-            scores = value_filled[np.arange(value_filled.shape[0]), r_idx]
-            scores = np.where(np.isfinite(scores), scores, 0.0)
-
-        arc_len = self._sr_arc_length(np.asarray(self.init_boundary.xy, dtype=float))
-        if min_spacing is None:
-            frac = 0.0 if min_arc_sep_frac is None else float(min_arc_sep_frac)
-            total = float(arc_len[-1])
-            per = total / max(count, 1) if total > 0.0 else 0.0
-            min_spacing = frac * per
-
-        scores = self._sr_restrict_by_compactness(scores, arc_len, compactness)
-
         selection = str(selection).lower().strip()
         if selection not in {"weighted", "greedy"}:
             raise ValueError("selection must be 'weighted' or 'greedy'")
 
         if selection == "greedy":
-            idx = self._sr_greedy_select_indices(scores, arc_len, float(min_spacing), int(count))
-        else:
-            idx = []
-            scores_work = scores.copy()
-            total = float(arc_len[-1])
-            min_spacing = float(min_spacing)
-            K = scores_work.size
-            for _ in range(int(count)):
-                weights = np.clip(scores_work, 0.0, None)
-                wsum = float(np.sum(weights))
-                if wsum <= 0.0 or not np.isfinite(wsum):
-                    valid = np.isfinite(scores_work)
-                    weights = np.zeros_like(scores_work)
-                    weights[valid] = 1.0
-                    wsum = float(np.sum(weights))
-                    if wsum <= 0.0:
-                        break
-                probs = weights / wsum
-                choice = int(self.rng.choice(K, p=probs))
-                idx.append(choice)
-
-                if total <= 0.0:
-                    scores_work[:] = 0.0
+            if np.any(weights_grid > 0.0):
+                scores = np.where(valid, weights_grid, -np.inf)
+            else:
+                scores = np.where(valid, value_grid, -np.inf)
+            flat_scores = scores.ravel()
+            order = np.argsort(flat_scores)[::-1]
+            idx_flat = []
+            for k in order:
+                if not np.isfinite(flat_scores[k]):
                     continue
-                for j in range(K):
-                    d = abs(arc_len[j] - arc_len[choice])
-                    d = min(d, total - d)
-                    if d < min_spacing:
-                        scores_work[j] = 0.0
+                idx_flat.append(int(k))
+                if len(idx_flat) >= int(count):
+                    break
+        else:
+            if np.any(weights_grid > 0.0):
+                weights = np.where(valid, weights_grid, 0.0)
+            else:
+                weights = valid.astype(float, copy=False)
+            w = weights.ravel()
+            wsum = float(np.sum(w))
+            if wsum <= 0.0 or not np.isfinite(wsum):
+                return []
+            probs = w / wsum
+            idx_flat = self.rng.choice(w.size, size=int(count), replace=True, p=probs).tolist()
 
-        r_base = (
-            self.sr_r_targets[np.clip(r_idx, 0, len(self.sr_r_targets) - 1)]
-            if r_value is None
-            else np.full(value_grid.shape[0], float(r_value), dtype=float)
-        )
+        r_offset = float(r_offset)
+        jitter_s = float(max(jitter_s, 0.0))
+        jitter_delta_rad = float(max(jitter_delta_rad, 0.0))
+
         out = []
-        for i in idx:
-            r = float(np.clip(float(r_base[i]) + float(r_offset), 0.0, 1.0))
-            out.append((i / float(self.sr_grid.shape[0]), r, 0.0))
+        for flat_idx in idx_flat:
+            i = int(flat_idx // weights_grid.shape[1])
+            j = int(flat_idx % weights_grid.shape[1])
+            s = i / float(self.sr_grid.shape[0])
+            if jitter_s > 0.0:
+                s = float((s + self.rng.normal(0.0, jitter_s)) % 1.0)
+
+            r = float(self.sr_r_targets[np.clip(j, 0, len(self.sr_r_targets) - 1)])
+            r = float(np.clip(r + r_offset, 0.0, 1.0))
+
+            if jitter_delta_rad > 0.0:
+                delta = self._wrap_angle(float(self.rng.normal(0.0, jitter_delta_rad)))
+            else:
+                delta = 0.0
+            out.append((s, r, delta))
         return out
 
     def sample_random_theta(self, n: int = 1):
@@ -629,30 +647,26 @@ class RetardantDropBayesOptSR:
         self,
         n: int,
         *,
-        r_value: float | None = 0.6,
-        r_offset: float = 0.0,
         n_keep: int | None = None,
-        compactness: float = 0.25,
-        min_spacing: float | None = None,
-        min_arc_sep_frac: float = 0.25,
         value_power: float = 1.0,
         value_offset: float | None = None,
         selection: str = "weighted",
+        r_offset: float = 0.0,
+        jitter_s: float = 0.0,
+        jitter_delta_rad: float = 0.0,
     ) -> np.ndarray:
         n = int(max(n, 1))
         n_keep = self.n_drones if n_keep is None else int(max(n_keep, 1))
 
         thetas = np.empty((n, self.dim), dtype=float)
         placements = self._sr_value_blocking(
-            r_value=r_value,
-            r_offset=r_offset,
             count=n_keep,
-            compactness=compactness,
-            min_spacing=min_spacing,
-            min_arc_sep_frac=min_arc_sep_frac,
             value_power=value_power,
             value_offset=value_offset,
             selection=selection,
+            r_offset=r_offset,
+            jitter_s=jitter_s,
+            jitter_delta_rad=jitter_delta_rad,
         )
 
         params = np.asarray(placements, dtype=float)
@@ -670,6 +684,154 @@ class RetardantDropBayesOptSR:
 
         return thetas[0] if n == 1 else thetas
 
+    def sample_uniform_ring_theta(
+        self,
+        n: int,
+        *,
+        r_value: float = 0.6,
+        phase: float | None = None,
+        jitter_s: float = 0.0,
+        jitter_r: float = 0.0,
+    ) -> np.ndarray:
+        """
+        Uniform ring placement: evenly spaced s positions at a fixed r, delta=0.
+
+        - `phase`: optional [0,1) shift applied to all s positions (random if None).
+        - `jitter_s`: optional Gaussian jitter applied to s (wraps around).
+        - `jitter_r`: optional Gaussian jitter applied to r (clipped).
+        """
+        n = int(max(n, 1))
+        r_value = float(np.clip(r_value, 0.0, 1.0))
+        jitter_s = float(max(jitter_s, 0.0))
+        jitter_r = float(max(jitter_r, 0.0))
+
+        base_s = np.linspace(0.0, 1.0, self.n_drones, endpoint=False)
+        thetas = np.empty((n, self.dim), dtype=float)
+        for i in range(n):
+            phase_i = float(self.rng.random()) if phase is None else float(phase)
+            s = (base_s + phase_i) % 1.0
+            if jitter_s > 0.0:
+                s = (s + self.rng.normal(0.0, jitter_s, size=s.size)) % 1.0
+
+            r = np.full_like(s, r_value, dtype=float)
+            if jitter_r > 0.0:
+                r = np.clip(r + self.rng.normal(0.0, jitter_r, size=r.size), 0.0, 1.0)
+
+            params = np.column_stack([s, r, np.zeros_like(s)])
+            thetas[i] = self._encode_sr_params(params)
+
+        return thetas[0] if n == 1 else thetas
+
+    def sample_downwind_line_theta(
+        self,
+        n: int,
+        *,
+        r_value: float = 0.6,
+        wind_bias: float = 2.0,
+        line_spacing_scale: float = 0.9,
+        center_jitter_cells: float = 0.0,
+        jitter_r: float = 0.0,
+        selection: str = "weighted",
+    ) -> np.ndarray:
+        """
+        Downwind line heuristic: place a connected line at constant-r, biased downwind.
+
+        - Picks a line center along s using wind-weighted sampling.
+        - Places drones along s with spacing based on drop_h_km.
+        - delta=0 for all drops (long axis along constant-r tangent).
+        """
+        if self.sr_grid is None or self.sr_r_targets is None or self.init_boundary is None:
+            raise RuntimeError("Call setup_search_grid_sr(...) before SR heuristics.")
+
+        n = int(max(n, 1))
+        r_value = float(np.clip(r_value, 0.0, 1.0))
+        jitter_r = float(max(jitter_r, 0.0))
+        line_spacing_scale = float(max(line_spacing_scale, 0.0))
+        center_jitter_cells = float(max(center_jitter_cells, 0.0))
+
+        selection = str(selection).lower().strip()
+        if selection not in {"weighted", "greedy"}:
+            raise ValueError("selection must be 'weighted' or 'greedy'")
+
+        inner_xy = np.asarray(self.init_boundary.xy, dtype=float)
+        arc_len = self._sr_arc_length(inner_xy)
+        total = float(arc_len[-1])
+        if total <= 0.0:
+            raise RuntimeError("SR arc length is zero; check boundary input.")
+
+        wind = self._estimate_mean_wind()
+        wind_mag = float(np.linalg.norm(wind))
+        if wind_mag > 1e-9:
+            wind_unit = wind / wind_mag
+        else:
+            wind_unit = np.array([1.0, 0.0], dtype=float)
+
+        proj = inner_xy @ wind_unit
+        if selection == "greedy":
+            weights = None
+            center_idx = int(np.argmax(proj))
+        else:
+            p_min = float(np.min(proj))
+            p_max = float(np.max(proj))
+            if p_max > p_min:
+                align = (proj - p_min) / (p_max - p_min)
+                align = 2.0 * align - 1.0
+            else:
+                align = np.zeros_like(proj)
+            bias = float(wind_bias)
+            weights = np.exp(np.clip(bias * np.clip(align, -1.0, 1.0), -20.0, 20.0))
+            wsum = float(np.sum(weights))
+            if wsum <= 0.0 or not np.isfinite(wsum):
+                weights = np.ones_like(proj)
+                wsum = float(np.sum(weights))
+            probs = weights / wsum
+
+        env = self.fire_model.env
+        spacing_cells = float(getattr(env, "drop_h_km", 0.0)) / max(float(self.fire_model.dx), 1e-9)
+        if spacing_cells <= 0.0:
+            spacing_cells = total / max(self.n_drones, 1)
+        spacing_cells *= line_spacing_scale
+
+        thetas = np.empty((n, self.dim), dtype=float)
+        K, R = self.sr_grid.shape[:2]
+        for i in range(n):
+            if selection == "weighted":
+                center_idx = int(self.rng.choice(len(proj), p=probs))
+
+            center_len = float(arc_len[center_idx])
+            if center_jitter_cells > 0.0:
+                center_len = (center_len + float(self.rng.normal(0.0, center_jitter_cells))) % total
+
+            if self.n_drones <= 1:
+                offsets = np.array([0.0], dtype=float)
+            else:
+                span = spacing_cells * float(self.n_drones - 1)
+                offsets = np.linspace(-0.5 * span, 0.5 * span, num=self.n_drones)
+
+            params: list[tuple[float, float, float]] = []
+            for off in offsets:
+                target_len = (center_len + float(off)) % total
+                idx = int(np.searchsorted(arc_len, target_len))
+                idx = min(idx, len(arc_len) - 1)
+
+                r = r_value
+                if jitter_r > 0.0:
+                    r = float(np.clip(r + float(self.rng.normal(0.0, jitter_r)), 0.0, 1.0))
+
+                j = int(np.round(r * (R - 1)))
+                if self.sr_valid_mask is not None and not self.sr_valid_mask[idx, j]:
+                    _, nn = self.sr_index_tree.query([idx, j], k=1)
+                    idx = int(self.sr_valid_indices[nn, 0])
+                    j = int(self.sr_valid_indices[nn, 1])
+
+                s = idx / float(K)
+                r_final = float(self.sr_r_targets[np.clip(j, 0, len(self.sr_r_targets) - 1)])
+                params.append((s, r_final, 0.0))
+
+            thetas[i] = self._encode_sr_params(np.asarray(params, dtype=float))
+
+        return thetas[0] if n == 1 else thetas
+
     def sample_initial_thetas(
         self,
         n_init: int,
@@ -682,6 +844,8 @@ class RetardantDropBayesOptSR:
         Strategy for choosing initial points before BO:
           - `random`: uniform over [0,1]^dim
           - `random_mask`: uniform over valid SR grid points + random delta
+          - `uniform_ring`: evenly spaced s at fixed r (delta=0)
+          - `downwind_line`: biased downwind line at constant r (delta=0)
           - `heuristic`: value-blocking placement with optional random_mask mixing
         """
         strategy = str(strategy).lower().strip()
@@ -692,8 +856,14 @@ class RetardantDropBayesOptSR:
             return self.sample_random_theta(n_init)
         if strategy == "random_mask":
             return self.sample_random_theta_on_mask(n_init)
+        if strategy in {"uniform_ring", "ring"}:
+            return self.sample_uniform_ring_theta(n_init)
+        if strategy in {"downwind_line", "downwind"}:
+            return self.sample_downwind_line_theta(n_init)
         if strategy != "heuristic":
-            raise ValueError("Unknown init strategy. Use 'random', 'random_mask', or 'heuristic'.")
+            raise ValueError(
+                "Unknown init strategy. Use 'random', 'random_mask', 'uniform_ring', 'downwind_line', or 'heuristic'."
+            )
 
         heuristic_kwargs = {} if heuristic_kwargs is None else dict(heuristic_kwargs)
         heuristic_random_frac = float(np.clip(heuristic_random_frac, 0.0, 1.0))
