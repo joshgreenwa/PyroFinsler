@@ -688,7 +688,8 @@ class RetardantDropBayesOptSR:
         self,
         n: int,
         *,
-        r_value: float = 0.6,
+        r_min: float = 0.0,
+        r_max: float = 1.0,
         phase: float | None = None,
         jitter_s: float = 0.0,
         jitter_r: float = 0.0,
@@ -696,18 +697,23 @@ class RetardantDropBayesOptSR:
         """
         Uniform ring placement: evenly spaced s positions at a fixed r, delta=0.
 
+        - `r_min`/`r_max`: sampled uniformly per placement (clipped to [0,1]).
         - `phase`: optional [0,1) shift applied to all s positions (random if None).
         - `jitter_s`: optional Gaussian jitter applied to s (wraps around).
         - `jitter_r`: optional Gaussian jitter applied to r (clipped).
         """
         n = int(max(n, 1))
-        r_value = float(np.clip(r_value, 0.0, 1.0))
+        r_min = float(np.clip(r_min, 0.0, 1.0))
+        r_max = float(np.clip(r_max, 0.0, 1.0))
+        if r_max < r_min:
+            r_min, r_max = r_max, r_min
         jitter_s = float(max(jitter_s, 0.0))
         jitter_r = float(max(jitter_r, 0.0))
 
         base_s = np.linspace(0.0, 1.0, self.n_drones, endpoint=False)
         thetas = np.empty((n, self.dim), dtype=float)
         for i in range(n):
+            r_value = float(self.rng.uniform(r_min, r_max))
             phase_i = float(self.rng.random()) if phase is None else float(phase)
             s = (base_s + phase_i) % 1.0
             if jitter_s > 0.0:
@@ -839,6 +845,24 @@ class RetardantDropBayesOptSR:
         strategy: str = "random",
         heuristic_random_frac: float = 0.2,
         heuristic_kwargs: dict | None = None,
+        heuristic_value_prob: float = 0.5,
+        heuristic_uniform_ring_prob: float = 0.25,
+        heuristic_downwind_prob: float = 0.25,
+        heuristic_mix_prob: float = 0.15,
+        heuristic_mix_ratio: float = 0.5,
+        value_r_offset: float = 0.0,
+        value_jitter_s: float = 0.01,
+        value_jitter_delta_rad: float = np.deg2rad(6.0),
+        uniform_ring_r_min: float = 0.0,
+        uniform_ring_r_max: float = 1.0,
+        uniform_ring_phase: float | None = None,
+        uniform_ring_jitter_s: float = 0.02,
+        uniform_ring_jitter_r: float = 0.01,
+        downwind_line_r_value: float = 0.7,
+        downwind_line_wind_bias: float = 2.0,
+        downwind_line_spacing_scale: float = 0.9,
+        downwind_line_center_jitter_cells: float = 2.0,
+        downwind_line_jitter_r: float = 0.01,
     ) -> np.ndarray:
         """
         Strategy for choosing initial points before BO:
@@ -846,7 +870,9 @@ class RetardantDropBayesOptSR:
           - `random_mask`: uniform over valid SR grid points + random delta
           - `uniform_ring`: evenly spaced s at fixed r (delta=0)
           - `downwind_line`: biased downwind line at constant r (delta=0)
-          - `heuristic`: value-blocking placement with optional random_mask mixing
+          - `heuristic`: mix of value-blocking (weighted peaks), uniform ring, and downwind line
+
+        When `strategy="heuristic"`, `heuristic_kwargs` override value-blocking settings only.
         """
         strategy = str(strategy).lower().strip()
         if n_init <= 0:
@@ -867,14 +893,81 @@ class RetardantDropBayesOptSR:
 
         heuristic_kwargs = {} if heuristic_kwargs is None else dict(heuristic_kwargs)
         heuristic_random_frac = float(np.clip(heuristic_random_frac, 0.0, 1.0))
+        heuristic_mix_prob = float(np.clip(heuristic_mix_prob, 0.0, 1.0))
+        heuristic_mix_ratio = float(np.clip(heuristic_mix_ratio, 0.0, 1.0))
+
+        probs = np.array(
+            [
+                float(max(heuristic_value_prob, 0.0)),
+                float(max(heuristic_uniform_ring_prob, 0.0)),
+                float(max(heuristic_downwind_prob, 0.0)),
+            ],
+            dtype=float,
+        )
+        if float(np.sum(probs)) <= 0.0:
+            probs = np.array([1.0, 0.0, 0.0], dtype=float)
+        probs = probs / float(np.sum(probs))
+        methods = ("value_blocking", "uniform_ring", "downwind_line")
+
+        value_blocking_kwargs = {
+            "selection": "weighted",
+            "value_power": 2.0,
+            "value_offset": None,
+            "r_offset": float(value_r_offset),
+            "jitter_s": float(max(value_jitter_s, 0.0)),
+            "jitter_delta_rad": float(max(value_jitter_delta_rad, 0.0)),
+        }
+        value_blocking_kwargs.update(heuristic_kwargs)
+        value_blocking_kwargs["selection"] = "weighted"
+
+        uniform_ring_kwargs = {
+            "r_min": float(uniform_ring_r_min),
+            "r_max": float(uniform_ring_r_max),
+            "phase": uniform_ring_phase,
+            "jitter_s": float(max(uniform_ring_jitter_s, 0.0)),
+            "jitter_r": float(max(uniform_ring_jitter_r, 0.0)),
+        }
+
+        downwind_line_kwargs = {
+            "r_value": float(np.clip(downwind_line_r_value, 0.0, 1.0)),
+            "wind_bias": float(downwind_line_wind_bias),
+            "line_spacing_scale": float(max(downwind_line_spacing_scale, 0.0)),
+            "center_jitter_cells": float(max(downwind_line_center_jitter_cells, 0.0)),
+            "jitter_r": float(max(downwind_line_jitter_r, 0.0)),
+            "selection": "weighted",
+        }
 
         n_rand = int(np.round(n_init * heuristic_random_frac))
         n_heur = int(n_init - n_rand)
         if n_heur <= 0:
             return self.sample_random_theta_on_mask(n_init)
 
-        A = self.sample_heuristic_theta(n_heur, **heuristic_kwargs)
-        A = np.atleast_2d(A)
+        def sample_method_theta(method: str) -> np.ndarray:
+            if method == "value_blocking":
+                return np.atleast_1d(self.sample_heuristic_theta(1, **value_blocking_kwargs))
+            if method == "uniform_ring":
+                return np.atleast_1d(self.sample_uniform_ring_theta(1, **uniform_ring_kwargs))
+            if method == "downwind_line":
+                return np.atleast_1d(self.sample_downwind_line_theta(1, **downwind_line_kwargs))
+            raise ValueError(f"Unknown heuristic method: {method}")
+
+        A = np.empty((n_heur, self.dim), dtype=float)
+        for i in range(n_heur):
+            if float(self.rng.random()) < heuristic_mix_prob:
+                m1 = str(self.rng.choice(methods, p=probs))
+                m2 = str(self.rng.choice(methods, p=probs))
+                if m2 == m1 and len(methods) > 1:
+                    m2 = str(self.rng.choice(methods, p=probs))
+
+                th1 = sample_method_theta(m1).reshape(self.n_drones, 3)
+                th2 = sample_method_theta(m2).reshape(self.n_drones, 3)
+                mask = self.rng.random(self.n_drones) < heuristic_mix_ratio
+                th = th1.copy()
+                th[~mask] = th2[~mask]
+                A[i] = th.reshape(self.dim)
+            else:
+                method = str(self.rng.choice(methods, p=probs))
+                A[i] = sample_method_theta(method).reshape(self.dim)
         if n_rand > 0:
             B = self.sample_random_theta_on_mask(n_rand)
             B = np.atleast_2d(B)
@@ -1047,6 +1140,24 @@ class RetardantDropBayesOptSR:
         init_strategy: str = "random",  # "random", "random_mask", "heuristic"
         init_heuristic_random_frac: float = 0.2,
         init_heuristic_kwargs: dict | None = None,
+        init_heuristic_value_prob: float = 0.5,
+        init_heuristic_uniform_ring_prob: float = 0.25,
+        init_heuristic_downwind_prob: float = 0.25,
+        init_heuristic_mix_prob: float = 0.15,
+        init_heuristic_mix_ratio: float = 0.5,
+        init_value_r_offset: float = 0.0,
+        init_value_jitter_s: float = 0.01,
+        init_value_jitter_delta_rad: float = np.deg2rad(6.0),
+        init_uniform_ring_r_min: float = 0.0,
+        init_uniform_ring_r_max: float = 1.0,
+        init_uniform_ring_phase: float | None = None,
+        init_uniform_ring_jitter_s: float = 0.02,
+        init_uniform_ring_jitter_r: float = 0.01,
+        init_downwind_line_r_value: float = 0.7,
+        init_downwind_line_wind_bias: float = 2.0,
+        init_downwind_line_spacing_scale: float = 0.9,
+        init_downwind_line_center_jitter_cells: float = 2.0,
+        init_downwind_line_jitter_r: float = 0.01,
         candidate_strategy: str = "random",  # "random", "random_mask", "qmc", "mixed"
         candidate_qmc: str = "sobol",
         candidate_global_masked: bool = False,
@@ -1082,6 +1193,24 @@ class RetardantDropBayesOptSR:
                 strategy="heuristic",
                 heuristic_random_frac=init_heuristic_random_frac,
                 heuristic_kwargs=heuristic_kwargs,
+                heuristic_value_prob=init_heuristic_value_prob,
+                heuristic_uniform_ring_prob=init_heuristic_uniform_ring_prob,
+                heuristic_downwind_prob=init_heuristic_downwind_prob,
+                heuristic_mix_prob=init_heuristic_mix_prob,
+                heuristic_mix_ratio=init_heuristic_mix_ratio,
+                value_r_offset=init_value_r_offset,
+                value_jitter_s=init_value_jitter_s,
+                value_jitter_delta_rad=init_value_jitter_delta_rad,
+                uniform_ring_r_min=init_uniform_ring_r_min,
+                uniform_ring_r_max=init_uniform_ring_r_max,
+                uniform_ring_phase=init_uniform_ring_phase,
+                uniform_ring_jitter_s=init_uniform_ring_jitter_s,
+                uniform_ring_jitter_r=init_uniform_ring_jitter_r,
+                downwind_line_r_value=init_downwind_line_r_value,
+                downwind_line_wind_bias=init_downwind_line_wind_bias,
+                downwind_line_spacing_scale=init_downwind_line_spacing_scale,
+                downwind_line_center_jitter_cells=init_downwind_line_center_jitter_cells,
+                downwind_line_jitter_r=init_downwind_line_jitter_r,
             )
         else:
             raise ValueError("Unknown init strategy. Use 'random', 'random_mask', or 'heuristic'.")
@@ -1215,11 +1344,31 @@ class RetardantDropBayesOptSR:
         *,
         heuristic_random_frac: float = 0.0,
         heuristic_kwargs: dict | None = None,
+        heuristic_value_prob: float = 0.5,
+        heuristic_uniform_ring_prob: float = 0.25,
+        heuristic_downwind_prob: float = 0.25,
+        heuristic_mix_prob: float = 0.15,
+        heuristic_mix_ratio: float = 0.5,
+        value_r_offset: float = 0.0,
+        value_jitter_s: float = 0.01,
+        value_jitter_delta_rad: float = np.deg2rad(6.0),
+        uniform_ring_r_min: float = 0.0,
+        uniform_ring_r_max: float = 1.0,
+        uniform_ring_phase: float | None = None,
+        uniform_ring_jitter_s: float = 0.02,
+        uniform_ring_jitter_r: float = 0.01,
+        downwind_line_r_value: float = 0.7,
+        downwind_line_wind_bias: float = 2.0,
+        downwind_line_spacing_scale: float = 0.9,
+        downwind_line_center_jitter_cells: float = 2.0,
+        downwind_line_jitter_r: float = 0.01,
+        plot_each: bool = False,
+        plot_each_n_sims: int | None = None,
         verbose: bool = True,
         print_every: int = 1,
     ):
         """
-        Heuristic search baseline (value-blocking only, repeated sampling).
+        Heuristic search baseline (mixed SR heuristics, repeated sampling).
         """
         if self.sr_grid is None:
             self.setup_search_grid_sr(
@@ -1240,6 +1389,24 @@ class RetardantDropBayesOptSR:
             strategy="heuristic",
             heuristic_random_frac=heuristic_random_frac,
             heuristic_kwargs=heuristic_kwargs,
+            heuristic_value_prob=heuristic_value_prob,
+            heuristic_uniform_ring_prob=heuristic_uniform_ring_prob,
+            heuristic_downwind_prob=heuristic_downwind_prob,
+            heuristic_mix_prob=heuristic_mix_prob,
+            heuristic_mix_ratio=heuristic_mix_ratio,
+            value_r_offset=value_r_offset,
+            value_jitter_s=value_jitter_s,
+            value_jitter_delta_rad=value_jitter_delta_rad,
+            uniform_ring_r_min=uniform_ring_r_min,
+            uniform_ring_r_max=uniform_ring_r_max,
+            uniform_ring_phase=uniform_ring_phase,
+            uniform_ring_jitter_s=uniform_ring_jitter_s,
+            uniform_ring_jitter_r=uniform_ring_jitter_r,
+            downwind_line_r_value=downwind_line_r_value,
+            downwind_line_wind_bias=downwind_line_wind_bias,
+            downwind_line_spacing_scale=downwind_line_spacing_scale,
+            downwind_line_center_jitter_cells=downwind_line_center_jitter_cells,
+            downwind_line_jitter_r=downwind_line_jitter_r,
         )
 
         y_vals: list[float] = []
@@ -1257,6 +1424,13 @@ class RetardantDropBayesOptSR:
                 best_theta = theta
 
             y_bests.append(best_y)
+
+            if plot_each:
+                self.plot_evolved_firestate(
+                    theta,
+                    n_sims=plot_each_n_sims,
+                    title_prefix=f"Heuristic SR #{i}",
+                )
 
             if verbose and (i % max(print_every, 1) == 0 or i == 1 or i == n_evals):
                 sr_params = self.decode_theta_sr(theta)
