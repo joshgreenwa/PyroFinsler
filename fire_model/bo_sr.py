@@ -257,14 +257,15 @@ class RetardantDropBayesOptSR:
             burning_prob_threshold=fm.env.avoid_drop_p_threshold,
         )
 
-    def _expected_value_from_firestate(self, evolved_firestate: FireState) -> float:
+    def _expected_value_from_firestate(self, evolved_firestate: FireState, env_override: CAFireModel | None = None) -> float:
+        env = self.fire_model.env if env_override is None else env_override
         p_burning = evolved_firestate.burning[0].astype(float, copy=False)
         p_burned = evolved_firestate.burned[0].astype(float, copy=False)
         p_affected = np.clip(p_burning + p_burned, 0.0, 1.0)
 
-        nx, _ = self.fire_model.env.grid_size
-        dx = self.fire_model.env.domain_km / nx
-        expected_value_burned = np.sum(p_affected * self.fire_model.env.value) * (dx ** 2)
+        nx, _ = env.grid_size
+        dx = env.domain_km / nx
+        expected_value_burned = np.sum(p_affected * env.value) * (dx ** 2)
         return float(expected_value_burned)
 
     def generate_search_grid(self, K: int = 500, boundary_field: str = "affected"):
@@ -1055,7 +1056,8 @@ class RetardantDropBayesOptSR:
             init_firestate_override=fs_override,
             scale_params_to_override=scale_params,
         )
-        return self._expected_value_from_firestate(evolved_firestate)
+        env_for_value = fm_override.env if fm_override is not None else self.fire_model.env
+        return self._expected_value_from_firestate(evolved_firestate, env_override=env_for_value)
 
     def plot_sr_domain(
         self,
@@ -1525,6 +1527,7 @@ class RetardantDropBayesOptSR:
         mf_max_high: int | None = None,
         mf_verbose: bool = False,
         mf_log_top_k_ei: int = 3,
+        mf_return_history: bool = False,
     ):
         """
         Two-fidelity BO (autoregressive co-kriging) that blends low- and high-fidelity evaluations.
@@ -1610,6 +1613,7 @@ class RetardantDropBayesOptSR:
 
         y_nexts_high: list[float] = list(y_high.tolist())
         y_bests_high: list[float] = [float(np.min(y_high))] if len(y_high) > 0 else []
+        mf_trace: list[dict[str, float | int | str]] = []
 
         if verbose:
             print(f"[MFBO SR] init low={len(y_low)}, high={len(y_high)}, dim={self.dim}")
@@ -1761,6 +1765,25 @@ class RetardantDropBayesOptSR:
                 y_nexts_high.append(y_next)
                 y_bests_high.append(float(np.min(y_high)))
 
+            if mf_return_history:
+                best_high_current = float(np.min(y_high)) if high_count > 0 else float("inf")
+                mf_trace.append(
+                    {
+                        "iter": int(it),
+                        "fidelity": fidelity_next,
+                        "y_next": float(y_next),
+                        "rho": float(rho),
+                        "ei": float(ei[best_ei_idx]),
+                        "mu_H": float(mu_H[best_ei_idx]),
+                        "sigma_H": float(sigma_H[best_ei_idx]),
+                        "mu_L": float(mu_L[best_ei_idx]),
+                        "sigma_L": float(sigma_L[best_ei_idx]),
+                        "low_count": int(low_count),
+                        "high_count": int(high_count),
+                        "best_high": best_high_current,
+                    }
+                )
+
             if verbose and (it % max(print_every, 1) == 0 or it == 1 or it == n_iters):
                 tag = "HIGH" if fidelity_next == "high" else "low"
                 print(
@@ -1804,6 +1827,8 @@ class RetardantDropBayesOptSR:
             print(f"[MFBO SR] done: best_high={best_y:.6g}")
             print(f"[MFBO SR] best params:\n{best_params}")
 
+        if mf_return_history:
+            return best_theta, best_params, best_y, (X_high, y_high), y_nexts_high, y_bests_high, mf_trace
         return best_theta, best_params, best_y, (X_high, y_high), y_nexts_high, y_bests_high
 
     def run_heuristic_search(
