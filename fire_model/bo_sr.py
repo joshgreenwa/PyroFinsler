@@ -206,25 +206,55 @@ class RetardantDropBayesOptSR:
             return np.mean(w0[burning], axis=0)
         return np.mean(w0.reshape(-1, 2), axis=0)
 
+    def _scale_params_to_env(self, drone_params: np.ndarray, target_env) -> np.ndarray:
+        """
+        Scale (x,y,phi) drone parameters to match the grid of `target_env`, preserving physical location.
+        Assumes both envs share the same physical domain size.
+        """
+        params = np.asarray(drone_params, dtype=float)
+        if params.ndim != 2 or params.shape[1] != 3:
+            raise ValueError(f"Expected drone_params with shape (D,3); got {params.shape}")
+        src_nx, src_ny = self.fire_model.env.grid_size
+        tgt_nx, tgt_ny = target_env.grid_size
+        scale_x = float(tgt_nx) / float(src_nx)
+        scale_y = float(tgt_ny) / float(src_ny)
+        out = params.copy()
+        out[:, 0] = params[:, 0] * scale_x
+        out[:, 1] = params[:, 1] * scale_y
+        return out
+
     def _simulate_firestate_with_params(
         self,
         drone_params: np.ndarray,
         *,
         n_sims: int | None = None,
+        evolution_time_s: float | None = None,
         seed: int | None = None,
+        fire_model_override: CAFireModel | None = None,
+        init_firestate_override: FireState | None = None,
+        scale_params_to_override: bool = False,
     ) -> FireState:
+        fm = self.fire_model if fire_model_override is None else fire_model_override
+        fs = self.init_firestate if init_firestate_override is None else init_firestate_override
+
         n_sims = self.n_sims if n_sims is None else int(n_sims)
-        return self.fire_model.simulate_from_firestate(
-            self.init_firestate,
-            T=self.evolution_time_s,
+        T = self.evolution_time_s if evolution_time_s is None else float(evolution_time_s)
+
+        params = (
+            self._scale_params_to_env(drone_params, fm.env) if scale_params_to_override else np.asarray(drone_params, dtype=float)
+        )
+
+        return fm.simulate_from_firestate(
+            fs,
+            T=T,
             n_sims=n_sims,
-            drone_params=drone_params,
-            ros_mps=self.fire_model.env.ros_mps,
-            wind_coeff=self.fire_model.env.wind_coeff,
-            diag=self.fire_model.env.diag,
+            drone_params=params,
+            ros_mps=fm.env.ros_mps,
+            wind_coeff=fm.env.wind_coeff,
+            diag=fm.env.diag,
             seed=seed,
-            avoid_burning_drop=self.fire_model.env.avoid_burning_drop,
-            burning_prob_threshold=self.fire_model.env.avoid_drop_p_threshold,
+            avoid_burning_drop=fm.env.avoid_burning_drop,
+            burning_prob_threshold=fm.env.avoid_drop_p_threshold,
         )
 
     def _expected_value_from_firestate(self, evolved_firestate: FireState) -> float:
@@ -986,9 +1016,45 @@ class RetardantDropBayesOptSR:
         order = self.rng.permutation(X.shape[0])
         return X[order]
 
-    def expected_value_burned_area(self, theta: np.ndarray, *, seed: int | None = None) -> float:
+    def expected_value_burned_area(
+        self,
+        theta: np.ndarray,
+        *,
+        seed: int | None = None,
+        fidelity: str = "high",
+        low_n_sims: int | None = None,
+        low_evolution_time_s: float | None = None,
+        low_fire_model: CAFireModel | None = None,
+        low_init_firestate: FireState | None = None,
+        low_scale_params: bool = False,
+    ) -> float:
         drone_params = self.decode_theta(theta)
-        evolved_firestate = self._simulate_firestate_with_params(drone_params, seed=seed)
+        fidelity = str(fidelity).lower().strip()
+        if fidelity not in {"high", "low"}:
+            raise ValueError("fidelity must be 'high' or 'low'")
+
+        if fidelity == "high":
+            n_sims = self.n_sims
+            evo_time = self.evolution_time_s
+            fm_override = None
+            fs_override = None
+            scale_params = False
+        else:
+            n_sims = self.n_sims if low_n_sims is None else int(max(low_n_sims, 1))
+            evo_time = self.evolution_time_s if low_evolution_time_s is None else float(low_evolution_time_s)
+            fm_override = low_fire_model
+            fs_override = low_init_firestate
+            scale_params = bool(low_scale_params)
+
+        evolved_firestate = self._simulate_firestate_with_params(
+            drone_params,
+            n_sims=n_sims,
+            evolution_time_s=evo_time,
+            seed=seed,
+            fire_model_override=fm_override,
+            init_firestate_override=fs_override,
+            scale_params_to_override=scale_params,
+        )
         return self._expected_value_from_firestate(evolved_firestate)
 
     def plot_sr_domain(
@@ -1177,7 +1243,60 @@ class RetardantDropBayesOptSR:
         candidate_local_sigma_delta_rad: float = np.deg2rad(15.0),
         candidate_local_resample_delta_prob: float = 0.05,
         eval_seed: int | None = None,
+        use_mfbo: bool = False,
+        mf_options: dict | None = None,
     ):
+        if use_mfbo:
+            mf_options = {} if mf_options is None else dict(mf_options)
+            return self.run_bayes_opt_mf(
+                n_init_high=n_init,
+                n_init_low=mf_options.pop("n_init_low", n_init),
+                n_iters=n_iters,
+                n_candidates=n_candidates,
+                xi=xi,
+                K_grid=K_grid,
+                boundary_field=boundary_field,
+                n_r=n_r,
+                smooth_iters=smooth_iters,
+                omega=omega,
+                verbose=verbose,
+                print_every=print_every,
+                use_ard_kernel=use_ard_kernel,
+                init_strategy=init_strategy,
+                init_heuristic_random_frac=init_heuristic_random_frac,
+                init_heuristic_kwargs=init_heuristic_kwargs,
+                init_heuristic_value_prob=init_heuristic_value_prob,
+                init_heuristic_uniform_ring_prob=init_heuristic_uniform_ring_prob,
+                init_heuristic_downwind_prob=init_heuristic_downwind_prob,
+                init_heuristic_mix_prob=init_heuristic_mix_prob,
+                init_heuristic_mix_ratio=init_heuristic_mix_ratio,
+                init_value_r_offset=init_value_r_offset,
+                init_value_jitter_r=init_value_jitter_r,
+                init_value_jitter_s=init_value_jitter_s,
+                init_value_jitter_delta_rad=init_value_jitter_delta_rad,
+                init_uniform_ring_r_min=init_uniform_ring_r_min,
+                init_uniform_ring_r_max=init_uniform_ring_r_max,
+                init_uniform_ring_phase=init_uniform_ring_phase,
+                init_uniform_ring_jitter_s=init_uniform_ring_jitter_s,
+                init_uniform_ring_jitter_r=init_uniform_ring_jitter_r,
+                init_downwind_line_r_value=init_downwind_line_r_value,
+                init_downwind_line_wind_bias=init_downwind_line_wind_bias,
+                init_downwind_line_spacing_scale=init_downwind_line_spacing_scale,
+                init_downwind_line_center_jitter_cells=init_downwind_line_center_jitter_cells,
+                init_downwind_line_jitter_r=init_downwind_line_jitter_r,
+                candidate_strategy=candidate_strategy,
+                candidate_qmc=candidate_qmc,
+                candidate_global_masked=candidate_global_masked,
+                candidate_local_frac=candidate_local_frac,
+                candidate_local_top_k=candidate_local_top_k,
+                candidate_local_sigma_s=candidate_local_sigma_s,
+                candidate_local_sigma_r=candidate_local_sigma_r,
+                candidate_local_sigma_delta_rad=candidate_local_sigma_delta_rad,
+                candidate_local_resample_delta_prob=candidate_local_resample_delta_prob,
+                eval_seed=eval_seed,
+                **mf_options,
+            )
+
         if self.sr_grid is None:
             self.setup_search_grid_sr(
                 K=K_grid,
@@ -1343,6 +1462,349 @@ class RetardantDropBayesOptSR:
             print(f"[BO SR] best params:\n{best_params}")
 
         return best_theta, best_params, best_y, (X, y), y_nexts, y_bests
+
+    def run_bayes_opt_mf(
+        self,
+        n_init_high: int = 5,
+        n_init_low: int = 5,
+        n_iters: int = 30,
+        n_candidates: int = 5000,
+        xi: float = 0.01,
+        K_grid: int = 500,
+        boundary_field: str = "affected",
+        n_r: int = 160,
+        smooth_iters: int = 350,
+        omega: float = 1.0,
+        verbose: bool = True,
+        print_every: int = 1,
+        use_ard_kernel: bool = False,
+        init_strategy: str = "random",  # "random", "random_mask", "heuristic"
+        init_heuristic_random_frac: float = 0.2,
+        init_heuristic_kwargs: dict | None = None,
+        init_heuristic_value_prob: float = 0.5,
+        init_heuristic_uniform_ring_prob: float = 0.25,
+        init_heuristic_downwind_prob: float = 0.25,
+        init_heuristic_mix_prob: float = 0.15,
+        init_heuristic_mix_ratio: float = 0.5,
+        init_value_r_offset: float = -0.02,
+        init_value_jitter_r: float = 0.02,
+        init_value_jitter_s: float = 0.01,
+        init_value_jitter_delta_rad: float = np.deg2rad(6.0),
+        init_uniform_ring_r_min: float = 0.0,
+        init_uniform_ring_r_max: float = 1.0,
+        init_uniform_ring_phase: float | None = None,
+        init_uniform_ring_jitter_s: float = 0.02,
+        init_uniform_ring_jitter_r: float = 0.01,
+        init_downwind_line_r_value: float = 0.7,
+        init_downwind_line_wind_bias: float = 2.0,
+        init_downwind_line_spacing_scale: float = 0.9,
+        init_downwind_line_center_jitter_cells: float = 2.0,
+        init_downwind_line_jitter_r: float = 0.01,
+        candidate_strategy: str = "random",  # "random", "random_mask", "qmc", "mixed"
+        candidate_qmc: str = "sobol",
+        candidate_global_masked: bool = False,
+        candidate_local_frac: float = 0.5,
+        candidate_local_top_k: int = 3,
+        candidate_local_sigma_s: float = 0.05,
+        candidate_local_sigma_r: float = 0.05,
+        candidate_local_sigma_delta_rad: float = np.deg2rad(15.0),
+        candidate_local_resample_delta_prob: float = 0.05,
+        eval_seed: int | None = None,
+        low_n_sims: int | None = None,
+        low_evolution_time_s: float | None = None,
+        low_fire_model: CAFireModel | None = None,
+        low_init_firestate: FireState | None = None,
+        low_scale_params: bool = True,
+        mf_warmup_low: int = 0,
+        mf_low_per_high: int = 1,
+        mf_low_cost: float = 0.1,
+        mf_high_cost: float = 1.0,
+        mf_rho_bounds: tuple[float, float] = (0.1, 10.0),
+        mf_rho_ridge: float = 1e-6,
+        mf_max_low: int | None = None,
+        mf_max_high: int | None = None,
+        mf_verbose: bool = False,
+        mf_log_top_k_ei: int = 3,
+    ):
+        """
+        Two-fidelity BO (autoregressive co-kriging) that blends low- and high-fidelity evaluations.
+        Keeps the single-fidelity API intact; opt in via `use_mfbo=True` or call directly.
+        """
+        if self.sr_grid is None:
+            self.setup_search_grid_sr(
+                K=K_grid,
+                boundary_field=boundary_field,
+                n_r=n_r,
+                smooth_iters=smooth_iters,
+                omega=omega,
+            )
+            if verbose:
+                print(f"[MFBO SR] Search grid set up with {self.sr_grid.shape[0]}x{self.sr_grid.shape[1]} points.")
+                self.fire_model.plot_search_domain(self.search_domain_mask, title="Search Domain (Between Boundaries)")
+                self.plot_sr_domain()
+
+        def _make_kernel():
+            if use_ard_kernel:
+                base = Matern(length_scale=np.ones(4 * self.n_drones, dtype=float), nu=2.5, length_scale_bounds=(1e-3, 1e3))
+            else:
+                base = TiedSRDeltaMatern(ls=0.2, lr=0.2, ldelta=0.5, nu=2.5, length_scale_bounds=(1e-3, 1e3))
+            return ConstantKernel(1.0, (1e-3, 1e3)) * base + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-6, 1e2))
+
+        def _sample_init_thetas(n_init: int):
+            strategy = str(init_strategy).lower().strip()
+            if strategy == "random":
+                return self.sample_random_theta(n_init)
+            if strategy == "random_mask":
+                return self.sample_random_theta_on_mask(n_init)
+            if strategy != "heuristic":
+                raise ValueError("Unknown init strategy. Use 'random', 'random_mask', or 'heuristic'.")
+            heuristic_kwargs = {} if init_heuristic_kwargs is None else dict(init_heuristic_kwargs)
+            return self.sample_initial_thetas(
+                n_init=n_init,
+                strategy="heuristic",
+                heuristic_random_frac=init_heuristic_random_frac,
+                heuristic_kwargs=heuristic_kwargs,
+                heuristic_value_prob=init_heuristic_value_prob,
+                heuristic_uniform_ring_prob=init_heuristic_uniform_ring_prob,
+                heuristic_downwind_prob=init_heuristic_downwind_prob,
+                heuristic_mix_prob=init_heuristic_mix_prob,
+                heuristic_mix_ratio=init_heuristic_mix_ratio,
+                value_r_offset=init_value_r_offset,
+                value_jitter_r=init_value_jitter_r,
+                value_jitter_s=init_value_jitter_s,
+                value_jitter_delta_rad=init_value_jitter_delta_rad,
+                uniform_ring_r_min=init_uniform_ring_r_min,
+                uniform_ring_r_max=init_uniform_ring_r_max,
+                uniform_ring_phase=init_uniform_ring_phase,
+                uniform_ring_jitter_s=init_uniform_ring_jitter_s,
+                uniform_ring_jitter_r=init_uniform_ring_jitter_r,
+                downwind_line_r_value=init_downwind_line_r_value,
+                downwind_line_wind_bias=init_downwind_line_wind_bias,
+                downwind_line_spacing_scale=init_downwind_line_spacing_scale,
+                downwind_line_center_jitter_cells=init_downwind_line_center_jitter_cells,
+                downwind_line_jitter_r=init_downwind_line_jitter_r,
+            )
+
+        X_theta_low = np.atleast_2d(_sample_init_thetas(n_init_low))
+        y_low = np.array(
+            [
+                self.expected_value_burned_area(
+                    th,
+                    seed=eval_seed,
+                    fidelity="low",
+                    low_n_sims=low_n_sims,
+                    low_evolution_time_s=low_evolution_time_s,
+                    low_fire_model=low_fire_model,
+                    low_init_firestate=low_init_firestate,
+                    low_scale_params=low_scale_params,
+                )
+                for th in X_theta_low
+            ],
+            dtype=float,
+        )
+        X_low = np.vstack([self.theta_to_gp_features(th) for th in X_theta_low]) if len(X_theta_low) > 0 else np.empty((0, 4 * self.n_drones))
+
+        X_theta_high = np.atleast_2d(_sample_init_thetas(n_init_high))
+        y_high = np.array([self.expected_value_burned_area(th, seed=eval_seed, fidelity="high") for th in X_theta_high], dtype=float)
+        X_high = np.vstack([self.theta_to_gp_features(th) for th in X_theta_high]) if len(X_theta_high) > 0 else np.empty((0, 4 * self.n_drones))
+
+        y_nexts_high: list[float] = list(y_high.tolist())
+        y_bests_high: list[float] = [float(np.min(y_high))] if len(y_high) > 0 else []
+
+        if verbose:
+            print(f"[MFBO SR] init low={len(y_low)}, high={len(y_high)}, dim={self.dim}")
+            if len(y_high) > 0:
+                print(f"[MFBO SR] init: best_high={float(np.min(y_high)):.6g}, mean_high={float(np.mean(y_high)):.6g}")
+
+        def _fit_gp(X_arr: np.ndarray, y_arr: np.ndarray):
+            if len(y_arr) == 0:
+                return None
+            gp = GaussianProcessRegressor(kernel=_make_kernel(), normalize_y=True, n_restarts_optimizer=2, random_state=None)
+            gp.fit(X_arr, y_arr)
+            return gp
+
+        def _ei_from(mu: np.ndarray, sigma: np.ndarray, y_best_val: float) -> np.ndarray:
+            sigma_safe = np.clip(sigma, 1e-9, None)
+            imp = y_best_val - mu - xi
+            Z = imp / sigma_safe
+            ei_val = imp * norm.cdf(Z) + sigma_safe * norm.pdf(Z)
+            ei_val[sigma_safe <= 0.0] = 0.0
+            return ei_val
+
+        low_count = len(y_low)
+        high_count = len(y_high)
+
+        for it in range(1, n_iters + 1):
+            gp_low = _fit_gp(X_low, y_low)
+
+            if gp_low is not None and high_count > 0:
+                mu_low_high = gp_low.predict(X_high, return_std=False)
+                denom = float(np.dot(mu_low_high, mu_low_high) + mf_rho_ridge)
+                if denom > 0.0:
+                    rho = float(np.clip(float(np.dot(mu_low_high, y_high)) / denom, mf_rho_bounds[0], mf_rho_bounds[1]))
+                else:
+                    rho = 1.0
+            else:
+                rho = 1.0
+
+            if high_count > 0 and gp_low is not None:
+                y_resid = y_high - rho * gp_low.predict(X_high, return_std=False)
+                gp_delta = _fit_gp(X_high, y_resid)
+            elif high_count > 0:
+                gp_delta = _fit_gp(X_high, y_high)
+            else:
+                gp_delta = None
+
+            cstrat = str(candidate_strategy).lower().strip()
+            if cstrat == "mixed":
+                local_frac = float(np.clip(candidate_local_frac, 0.0, 1.0))
+                n_local = int(np.round(n_candidates * local_frac))
+                n_global = int(n_candidates - n_local)
+                globals_ = self.sample_random_theta_on_mask(n_global) if candidate_global_masked else self.sample_qmc_theta(n_global, method=candidate_qmc)
+                if n_local > 0 and high_count > 0:
+                    top_k = int(max(candidate_local_top_k, 1))
+                    best_idx = np.argsort(y_high)[:top_k]
+                    anchors = X_theta_high[best_idx]
+                    locals_ = self.sample_local_theta(
+                        anchors,
+                        n_local,
+                        sigma_s=candidate_local_sigma_s,
+                        sigma_r=candidate_local_sigma_r,
+                        sigma_delta_rad=candidate_local_sigma_delta_rad,
+                        resample_delta_prob=candidate_local_resample_delta_prob,
+                    )
+                    Xcand_theta = np.vstack([np.atleast_2d(globals_), np.atleast_2d(locals_)])
+                else:
+                    Xcand_theta = np.atleast_2d(globals_)
+            elif cstrat == "qmc":
+                Xcand_theta = self.sample_qmc_theta(n_candidates, method=candidate_qmc)
+            elif cstrat == "random":
+                Xcand_theta = self.sample_random_theta(n_candidates)
+            elif cstrat == "random_mask":
+                Xcand_theta = self.sample_random_theta_on_mask(n_candidates)
+            else:
+                raise ValueError("Unknown candidate_strategy. Use 'random', 'random_mask', 'qmc', or 'mixed'.")
+
+            Xcand_theta = np.atleast_2d(Xcand_theta)
+            Xcand = np.vstack([self.theta_to_gp_features(th) for th in Xcand_theta])
+
+            if gp_low is not None:
+                mu_L, sigma_L = gp_low.predict(Xcand, return_std=True)
+            else:
+                mu_L = np.zeros(Xcand.shape[0], dtype=float)
+                sigma_L = np.full(Xcand.shape[0], 1.0, dtype=float)
+
+            if gp_delta is not None:
+                mu_D, sigma_D = gp_delta.predict(Xcand, return_std=True)
+            else:
+                mu_D = np.zeros(Xcand.shape[0], dtype=float)
+                sigma_D = np.zeros(Xcand.shape[0], dtype=float)
+
+            mu_H = rho * mu_L + mu_D
+            sigma_H = np.sqrt(np.clip((rho ** 2) * (sigma_L ** 2) + (sigma_D ** 2), 1e-12, None))
+
+            if high_count > 0:
+                y_best_ref = float(np.min(y_high))
+            elif low_count > 0:
+                y_best_ref = float(np.min(y_low))
+            else:
+                y_best_ref = float("inf")
+
+            ei = _ei_from(mu_H, sigma_H, y_best_ref)
+            best_ei_idx = int(np.argmax(ei))
+
+            # Decide fidelity to evaluate next.
+            force_high = high_count == 0
+            low_budget_ok = mf_max_low is None or low_count < mf_max_low
+            high_budget_ok = mf_max_high is None or high_count < mf_max_high
+
+            fidelity_next = "high"
+            if not force_high:
+                prefer_low = low_count < max(mf_warmup_low, mf_low_per_high * max(high_count, 1))
+                if prefer_low and low_budget_ok:
+                    fidelity_next = "low"
+                elif low_budget_ok:
+                    sigma_L_best = float(sigma_L[best_ei_idx]) if sigma_L.size > 0 else 0.0
+                    ei_high_cost = float(ei[best_ei_idx]) / max(mf_high_cost, 1e-9)
+                    gain_low = (rho ** 2) * (sigma_L_best ** 2) / max(mf_low_cost, 1e-9)
+                    if gain_low > ei_high_cost:
+                        fidelity_next = "low"
+            if fidelity_next == "high" and not high_budget_ok and low_budget_ok:
+                fidelity_next = "low"
+            if fidelity_next == "low" and not low_budget_ok and high_budget_ok:
+                fidelity_next = "high"
+
+            theta_next = Xcand_theta[best_ei_idx]
+            if fidelity_next == "low":
+                y_next = float(
+                    self.expected_value_burned_area(
+                        theta_next,
+                        seed=eval_seed,
+                        fidelity="low",
+                        low_n_sims=low_n_sims,
+                        low_evolution_time_s=low_evolution_time_s,
+                        low_fire_model=low_fire_model,
+                        low_init_firestate=low_init_firestate,
+                        low_scale_params=low_scale_params,
+                    )
+                )
+                X_theta_low = np.vstack([X_theta_low, theta_next])
+                X_low = np.vstack([X_low, Xcand[best_ei_idx]])
+                y_low = np.append(y_low, y_next)
+                low_count += 1
+            else:
+                y_next = float(self.expected_value_burned_area(theta_next, seed=eval_seed, fidelity="high"))
+                X_theta_high = np.vstack([X_theta_high, theta_next])
+                X_high = np.vstack([X_high, Xcand[best_ei_idx]])
+                y_high = np.append(y_high, y_next)
+                high_count += 1
+                y_nexts_high.append(y_next)
+                y_bests_high.append(float(np.min(y_high)))
+
+            if verbose and (it % max(print_every, 1) == 0 or it == 1 or it == n_iters):
+                tag = "HIGH" if fidelity_next == "high" else "low"
+                print(
+                    f"[MFBO SR] iter {it:03d}/{n_iters} | fidelity={tag} | y_next={y_next:.6g} | "
+                    f"best_high={float(np.min(y_high)):.6g} | rho={rho:.3g} | ei={float(ei[best_ei_idx]):.3g}"
+                )
+                sr_params = self.decode_theta_sr(theta_next)
+                params = self.decode_theta(theta_next)
+                print(f"      proposed (s,r,delta):\n      {sr_params}\n      (x,y,phi):\n      {params}")
+                if mf_verbose:
+                    print(
+                        f"      counts: low={low_count} (max={mf_max_low}), high={high_count} (max={mf_max_high}), "
+                        f"warmup_low={mf_warmup_low}, low_per_high={mf_low_per_high}"
+                    )
+                    print(
+                        f"      mu_H={float(mu_H[best_ei_idx]):.4g}, sigma_H={float(sigma_H[best_ei_idx]):.4g}, "
+                        f"mu_L={float(mu_L[best_ei_idx]):.4g}, sigma_L={float(sigma_L[best_ei_idx]):.4g}"
+                    )
+                    k = int(max(mf_log_top_k_ei, 0))
+                    if k > 0:
+                        top_idx = np.argsort(ei)[::-1][:k]
+                        print("      top EI (idx, ei, mu_H, sigma_H):")
+                        for j in top_idx:
+                            print(
+                                f"        {int(j):4d}: ei={float(ei[j]):.4g}, mu_H={float(mu_H[j]):.4g}, sigma_H={float(sigma_H[j]):.4g}"
+                            )
+
+        if high_count == 0:
+            # Fallback if no high-fidelity calls were made.
+            best_idx_low = int(np.argmin(y_low))
+            best_theta = X_theta_low[best_idx_low]
+            best_params = self.decode_theta(best_theta)
+            best_y = float(y_low[best_idx_low])
+        else:
+            best_idx = int(np.argmin(y_high))
+            best_theta = X_theta_high[best_idx]
+            best_params = self.decode_theta(best_theta)
+            best_y = float(y_high[best_idx])
+
+        if verbose:
+            print(f"[MFBO SR] done: best_high={best_y:.6g}")
+            print(f"[MFBO SR] best params:\n{best_params}")
+
+        return best_theta, best_params, best_y, (X_high, y_high), y_nexts_high, y_bests_high
 
     def run_heuristic_search(
         self,
