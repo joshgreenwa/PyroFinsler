@@ -26,7 +26,7 @@ class FireEnv:
     drop_w_km: float = 0.2
     drop_h_km: float = 1.0
     drop_amount: float = 1.0
-    ros_mps: float = 0.5
+    ros_mps: float | np.ndarray = 0.5  # scalar by default; optionally time-varying (T,) or (T,nx,ny)
     wind_coeff: float = 0.6
     slope: np.ndarray | None = None  # optional (nx, ny, 2) slope vectors
     diag: bool = True
@@ -54,6 +54,58 @@ class CAFireModel:
         nx, _ = env.grid_size
         self.dx = self.env.domain_km / nx
         self.dx_m = self.dx * 1000.0
+
+    @staticmethod
+    def _slice_time_param(param: np.ndarray, has_time_axis: bool, step_idx: int) -> np.ndarray:
+        """Return the view of `param` at `step_idx` if it has a time axis on dim=1."""
+        if not has_time_axis:
+            return param
+        t = int(np.clip(step_idx, 0, param.shape[1] - 1))
+        if param.ndim == 2:
+            return param[:, t]
+        if param.ndim == 4:
+            return param[:, t, :, :]
+        return param
+
+    def _prepare_ros_samples(
+        self,
+        base_ros_mps,
+        n_sims: int,
+        rng: np.random.Generator,
+        *,
+        jitter_frac: float | None = None,
+    ) -> tuple[np.ndarray, bool]:
+        """
+        Expand ros_mps into shape (n_sims, ...) and optionally add jitter.
+
+        Supports:
+        - scalar
+        - (T,) time series
+        - (nx, ny) spatially varying constant
+        - (T, nx, ny) time-varying spatial field
+        """
+        base = np.asarray(base_ros_mps, dtype=float)
+        if base.ndim == 0:
+            ros = np.full((n_sims,), float(base))
+            has_time = False
+        elif base.ndim == 1:
+            ros = np.broadcast_to(base, (n_sims,) + base.shape).copy()
+            has_time = True
+        elif base.ndim == 2:
+            ros = np.broadcast_to(base, (n_sims,) + base.shape).copy()
+            has_time = False
+        elif base.ndim == 3:
+            ros = np.broadcast_to(base, (n_sims,) + base.shape).copy()
+            has_time = True
+        else:
+            raise ValueError("ros_mps must be scalar, (T,), (nx,ny), or (T,nx,ny).")
+
+        frac = float(self.env.ros_future_jitter_frac if jitter_frac is None else jitter_frac)
+        if frac > 0.0:
+            noise = rng.normal(0.0, frac, size=ros.shape)
+            ros = np.clip(ros * (1.0 + noise), 1e-6, None)
+
+        return ros, has_time
 
     def init_state_batch(self, n_sims: int, center, radius_km: float) -> FireState:
         nx, ny = self.env.grid_size
@@ -215,14 +267,17 @@ class CAFireModel:
         center,
         radius_km: float,
         *,
-        ros_mps: float = 0.5,
+        ros_mps: float | np.ndarray = 0.5,
         wind_coeff: float = 0.50,
         diag: bool = True,
     ) -> np.ndarray:
         state = self.init_state_batch(n_sims=n_sims, center=center, radius_km=radius_km)
         num_steps = int(T / self.env.dt_s)
-        for _ in range(num_steps):
-            self.step_batch(state, ros_mps=ros_mps, wind_coeff=wind_coeff, diag=diag)
+        rng = np.random.default_rng(self.base_seed)
+        ros_samples, ros_has_time = self._prepare_ros_samples(ros_mps, n_sims, rng, jitter_frac=0.0)
+        for step_idx in range(num_steps):
+            ros_step = self._slice_time_param(ros_samples, ros_has_time, step_idx)
+            self.step_batch(state, ros_mps=ros_step, wind_coeff=wind_coeff, diag=diag)
         p_affected = (state.burned | state.burning).mean(axis=0)
         return p_affected
 
@@ -332,7 +387,6 @@ class CAFireModel:
         half_w = max(0.5, 0.5 * (drop_w_km / self.dx))
         half_h = max(0.5, 0.5 * (drop_h_km / self.dx))
 
-        print(f"Applying retardant drop: D={drone_params}, amount={amount}, drop_w_km={drop_w_km}, drop_h_km={drop_h_km}")
         X = np.arange(nx)[:, None]
         Y = np.arange(ny)[None, :]
 
@@ -425,7 +479,7 @@ class CAFireModel:
         else:
             rng = np.random.default_rng(self.base_seed)
 
-        ros_samples, wind_coeff_samples = self._sample_future_spread_params(
+        ros_samples, wind_coeff_samples, ros_has_time = self._sample_future_spread_params(
             n_sims,
             base_ros_mps=ros_mps,
             base_wind_coeff=wind_coeff,
@@ -433,8 +487,9 @@ class CAFireModel:
         )
 
         num_steps = int(T / self.env.dt_s)
-        for _ in range(num_steps):
-            self.step_batch(state, ros_mps=ros_samples, wind_coeff=wind_coeff_samples, diag=diag)
+        for step_idx in range(num_steps):
+            ros_step = self._slice_time_param(ros_samples, ros_has_time, step_idx)
+            self.step_batch(state, ros_mps=ros_step, wind_coeff=wind_coeff_samples, diag=diag)
 
         updated_firestate = self.aggregate_mc_to_state(state)
         return updated_firestate
@@ -443,24 +498,30 @@ class CAFireModel:
         self,
         n_sims: int,
         *,
-        base_ros_mps: float,
+        base_ros_mps: float | np.ndarray,
         base_wind_coeff: float,
         rng: np.random.Generator,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        ros = np.full(int(n_sims), float(base_ros_mps), dtype=float)
-        wind_coeff = np.full(int(n_sims), float(base_wind_coeff), dtype=float)
-
-        frac_ros = max(float(self.env.ros_future_jitter_frac), 0.0)
-        if frac_ros > 0.0:
-            noise = rng.normal(0.0, frac_ros, size=n_sims)
-            ros = np.clip(ros * (1.0 + noise), 1e-6, None)
+    ) -> tuple[np.ndarray, np.ndarray, bool]:
+        ros, ros_has_time = self._prepare_ros_samples(base_ros_mps, n_sims, rng)
+        wind_arr = np.asarray(base_wind_coeff, dtype=float)
+        if wind_arr.ndim == 0:
+            wind_coeff = np.full(int(n_sims), float(wind_arr), dtype=float)
+        elif wind_arr.ndim == 1:
+            if wind_arr.size == 1:
+                wind_coeff = np.full(int(n_sims), float(wind_arr[0]), dtype=float)
+            elif wind_arr.shape[0] == n_sims:
+                wind_coeff = wind_arr.astype(float, copy=True)
+            else:
+                raise ValueError("wind_coeff array must have length equal to n_sims or be scalar.")
+        else:
+            raise ValueError("wind_coeff must be scalar or 1D array.")
 
         frac_wind = max(float(self.env.wind_coeff_future_jitter_frac), 0.0)
         if frac_wind > 0.0:
             noise = rng.normal(0.0, frac_wind, size=n_sims)
             wind_coeff = np.clip(wind_coeff * (1.0 + noise), 0.0, None)
 
-        return ros, wind_coeff
+        return ros, wind_coeff, ros_has_time
 
     def simulate_from_firestate(
         self,
@@ -551,15 +612,16 @@ class CAFireModel:
             cell_cap=self.env.retardant_cell_cap,
         )
 
-        ros_samples, wind_coeff_samples = self._sample_future_spread_params(
+        ros_samples, wind_coeff_samples, ros_has_time = self._sample_future_spread_params(
             n_sims,
             base_ros_mps=ros_mps,
             base_wind_coeff=wind_coeff,
             rng=rng,
         )
 
-        for _ in range(num_steps):
-            self.step_batch(state, ros_mps=ros_samples, wind_coeff=wind_coeff_samples, diag=diag)
+        for step_idx in range(num_steps):
+            ros_step = self._slice_time_param(ros_samples, ros_has_time, step_idx)
+            self.step_batch(state, ros_mps=ros_step, wind_coeff=wind_coeff_samples, diag=diag)
 
         return self.aggregate_mc_to_state(state)
 

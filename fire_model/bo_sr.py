@@ -484,6 +484,7 @@ class RetardantDropBayesOptSR:
         value_offset: float | None = None,
         selection: str = "weighted",
         r_offset: float = 0.0,
+        jitter_r: float = 0.0,
         jitter_s: float = 0.0,
         jitter_delta_rad: float = 0.0,
     ) -> list[tuple[float, float, float]]:
@@ -531,6 +532,7 @@ class RetardantDropBayesOptSR:
             idx_flat = self.rng.choice(w.size, size=int(count), replace=True, p=probs).tolist()
 
         r_offset = float(r_offset)
+        jitter_r = float(max(jitter_r, 0.0))
         jitter_s = float(max(jitter_s, 0.0))
         jitter_delta_rad = float(max(jitter_delta_rad, 0.0))
 
@@ -544,6 +546,8 @@ class RetardantDropBayesOptSR:
 
             r = float(self.sr_r_targets[np.clip(j, 0, len(self.sr_r_targets) - 1)])
             r = float(np.clip(r + r_offset, 0.0, 1.0))
+            if jitter_r > 0.0:
+                r = float(np.clip(r + float(self.rng.normal(0.0, jitter_r)), 0.0, 1.0))
 
             if jitter_delta_rad > 0.0:
                 delta = self._wrap_angle(float(self.rng.normal(0.0, jitter_delta_rad)))
@@ -652,6 +656,7 @@ class RetardantDropBayesOptSR:
         value_offset: float | None = None,
         selection: str = "weighted",
         r_offset: float = 0.0,
+        jitter_r: float = 0.02,
         jitter_s: float = 0.0,
         jitter_delta_rad: float = 0.0,
     ) -> np.ndarray:
@@ -665,6 +670,7 @@ class RetardantDropBayesOptSR:
             value_offset=value_offset,
             selection=selection,
             r_offset=r_offset,
+            jitter_r=jitter_r,
             jitter_s=jitter_s,
             jitter_delta_rad=jitter_delta_rad,
         )
@@ -850,7 +856,8 @@ class RetardantDropBayesOptSR:
         heuristic_downwind_prob: float = 0.25,
         heuristic_mix_prob: float = 0.15,
         heuristic_mix_ratio: float = 0.5,
-        value_r_offset: float = 0.0,
+        value_r_offset: float = -0.02,
+        value_jitter_r: float = 0.02,
         value_jitter_s: float = 0.01,
         value_jitter_delta_rad: float = np.deg2rad(6.0),
         uniform_ring_r_min: float = 0.0,
@@ -914,6 +921,7 @@ class RetardantDropBayesOptSR:
             "value_power": 2.0,
             "value_offset": None,
             "r_offset": float(value_r_offset),
+            "jitter_r": float(max(value_jitter_r, 0.0)),
             "jitter_s": float(max(value_jitter_s, 0.0)),
             "jitter_delta_rad": float(max(value_jitter_delta_rad, 0.0)),
         }
@@ -978,9 +986,9 @@ class RetardantDropBayesOptSR:
         order = self.rng.permutation(X.shape[0])
         return X[order]
 
-    def expected_value_burned_area(self, theta: np.ndarray) -> float:
+    def expected_value_burned_area(self, theta: np.ndarray, *, seed: int | None = None) -> float:
         drone_params = self.decode_theta(theta)
-        evolved_firestate = self._simulate_firestate_with_params(drone_params)
+        evolved_firestate = self._simulate_firestate_with_params(drone_params, seed=seed)
         return self._expected_value_from_firestate(evolved_firestate)
 
     def plot_sr_domain(
@@ -1145,7 +1153,8 @@ class RetardantDropBayesOptSR:
         init_heuristic_downwind_prob: float = 0.25,
         init_heuristic_mix_prob: float = 0.15,
         init_heuristic_mix_ratio: float = 0.5,
-        init_value_r_offset: float = 0.0,
+        init_value_r_offset: float = -0.02,
+        init_value_jitter_r: float = 0.02,
         init_value_jitter_s: float = 0.01,
         init_value_jitter_delta_rad: float = np.deg2rad(6.0),
         init_uniform_ring_r_min: float = 0.0,
@@ -1167,6 +1176,7 @@ class RetardantDropBayesOptSR:
         candidate_local_sigma_r: float = 0.05,
         candidate_local_sigma_delta_rad: float = np.deg2rad(15.0),
         candidate_local_resample_delta_prob: float = 0.05,
+        eval_seed: int | None = None,
     ):
         if self.sr_grid is None:
             self.setup_search_grid_sr(
@@ -1199,6 +1209,7 @@ class RetardantDropBayesOptSR:
                 heuristic_mix_prob=init_heuristic_mix_prob,
                 heuristic_mix_ratio=init_heuristic_mix_ratio,
                 value_r_offset=init_value_r_offset,
+                value_jitter_r=init_value_jitter_r,
                 value_jitter_s=init_value_jitter_s,
                 value_jitter_delta_rad=init_value_jitter_delta_rad,
                 uniform_ring_r_min=init_uniform_ring_r_min,
@@ -1216,7 +1227,7 @@ class RetardantDropBayesOptSR:
             raise ValueError("Unknown init strategy. Use 'random', 'random_mask', or 'heuristic'.")
 
         X_theta = np.atleast_2d(X_theta)
-        y = np.array([self.expected_value_burned_area(th) for th in X_theta], dtype=float)
+        y = np.array([self.expected_value_burned_area(th, seed=eval_seed) for th in X_theta], dtype=float)
         X = np.vstack([self.theta_to_gp_features(th) for th in X_theta])
 
         if verbose:
@@ -1298,7 +1309,7 @@ class RetardantDropBayesOptSR:
             mu_next = float(mu_next[0])
             std_next = float(std_next[0])
 
-            y_next = float(self.expected_value_burned_area(theta_next))
+            y_next = float(self.expected_value_burned_area(theta_next, seed=eval_seed))
 
             X_theta = np.vstack([X_theta, theta_next])
             X = np.vstack([X, x_next])
@@ -1349,7 +1360,8 @@ class RetardantDropBayesOptSR:
         heuristic_downwind_prob: float = 0.25,
         heuristic_mix_prob: float = 0.15,
         heuristic_mix_ratio: float = 0.5,
-        value_r_offset: float = 0.0,
+        value_r_offset: float = -0.02,
+        value_jitter_r: float = 0.02,
         value_jitter_s: float = 0.01,
         value_jitter_delta_rad: float = np.deg2rad(6.0),
         uniform_ring_r_min: float = 0.0,
@@ -1366,6 +1378,7 @@ class RetardantDropBayesOptSR:
         plot_each_n_sims: int | None = None,
         verbose: bool = True,
         print_every: int = 1,
+        eval_seed: int | None = None,
     ):
         """
         Heuristic search baseline (mixed SR heuristics, repeated sampling).
@@ -1395,6 +1408,7 @@ class RetardantDropBayesOptSR:
             heuristic_mix_prob=heuristic_mix_prob,
             heuristic_mix_ratio=heuristic_mix_ratio,
             value_r_offset=value_r_offset,
+            value_jitter_r=value_jitter_r,
             value_jitter_s=value_jitter_s,
             value_jitter_delta_rad=value_jitter_delta_rad,
             uniform_ring_r_min=uniform_ring_r_min,
@@ -1416,7 +1430,7 @@ class RetardantDropBayesOptSR:
         best_y = float("inf")
 
         for i, theta in enumerate(np.atleast_2d(thetas), start=1):
-            y_val = float(self.expected_value_burned_area(theta))
+            y_val = float(self.expected_value_burned_area(theta, seed=eval_seed))
             y_vals.append(y_val)
 
             if y_val < best_y:
